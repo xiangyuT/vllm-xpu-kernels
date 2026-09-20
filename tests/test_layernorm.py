@@ -10,7 +10,8 @@ from tests.utils import opcheck
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", [(1, 5120), (1, 257), (1, 12, 256),
+@pytest.mark.parametrize("shape", [(1, 5120), (1, 2048), (1, 257),
+                                   (1, 12, 256), (1, 8, 256), (1, 1, 256),
                                    (1, 2, 256), (1, 16, 128)])
 @pytest.mark.parametrize("strided", [False, True])
 @torch.inference_mode()
@@ -36,7 +37,7 @@ def test_rms_norm_fp32_weight(dtype, shape, strided):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("hidden", [256, 257, 5120])
+@pytest.mark.parametrize("hidden", [256, 257, 2048, 5120])
 @pytest.mark.parametrize("strided", [False, True])
 @torch.inference_mode()
 def test_fused_add_rms_norm_fp32_weight(dtype, hidden, strided):
@@ -179,18 +180,19 @@ def test_rms_norm_uncontigous(
 
 @pytest.mark.parametrize("seed", [42, 43, 44])
 @pytest.mark.parametrize("case", ["random", "zero", "extreme_gate"])
+@pytest.mark.parametrize("rows", [16, 24])
 @torch.inference_mode()
-def test_gated_decode_norm_preserves_inputs(seed, case):
+def test_gated_decode_norm_preserves_inputs(seed, case, rows):
     """GDN bsz=1: FP32 norm/gate math and a single FP16 output cast."""
     torch.manual_seed(seed)
-    x = torch.randn(24, 128, device="xpu", dtype=torch.float16)
+    x = torch.randn(rows, 128, device="xpu", dtype=torch.float16)
     z = torch.randn_like(x)
     weight = torch.randn(128, device="xpu", dtype=torch.float16)
     if case == "zero":
         x.zero_()
     elif case == "extreme_gate":
         z = torch.linspace(-80, 80, 128, device="xpu",
-                           dtype=torch.float16).expand(24, -1).contiguous()
+                           dtype=torch.float16).expand(rows, -1).contiguous()
         x.mul_(100)
     originals = [t.clone() for t in (x, z, weight)]
     out = torch.full_like(x, float("nan"))
