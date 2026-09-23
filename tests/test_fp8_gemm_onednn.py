@@ -83,6 +83,31 @@ MINI_PYTEST_PARAMS = {
 }
 
 
+@pytest.mark.parametrize("m", [1, 8])
+def test_fp8_gemm_block_decode_dispatch(m):
+    """Single-token decode consumes FP16 A; prefill consumes quantized A."""
+    torch.manual_seed(42)
+    k = n = 256
+    a = torch.randn((m, k), device="xpu", dtype=torch.float16)
+    a_quant = torch.zeros_like(a).to(torch.float8_e4m3fn)
+    b = torch.ones((n, k), device="xpu", dtype=torch.float16)
+    b = b.to(torch.float8_e4m3fn).t()
+    a_scale = torch.ones((m, k // 128), device="xpu", dtype=torch.float32)
+    b_scale = torch.ones((k // 128, n // 128), device="xpu",
+                         dtype=torch.float32)
+
+    actual = torch.ops._xpu_C.fp8_gemm_block_decode(
+        a, a_quant, b, a_scale, b_scale)
+    if m == 1:
+        expected = torch.ops._xpu_C.fp8_gemm_w8a16(a, b, b_scale, None)
+        assert bool(torch.any(actual != 0))
+    else:
+        expected = torch.ops._xpu_C.fp8_gemm(
+            a_quant, b, torch.float16, a_scale, b_scale, None)
+        assert bool(torch.all(actual == 0))
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("out_dtype", OUT_DTYPES)
 @pytest.mark.parametrize("trans_wei", [True, False])

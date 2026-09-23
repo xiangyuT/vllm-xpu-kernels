@@ -40,6 +40,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.impl("fp8_gemm_w8a16", torch::kXPU, &fp8_gemm_w8a16);
 
   xpu_ops.def(
+      "fp8_gemm_block_decode(Tensor A, Tensor A_quant, Tensor B, "
+      "Tensor A_scale, Tensor B_scale) -> Tensor");
+  xpu_ops.impl("fp8_gemm_block_decode", torch::kXPU, &fp8_gemm_block_decode);
+
+  xpu_ops.def(
       "fp4_gemm(Tensor A, Tensor B, Tensor A_scale, Tensor B_scale, "
       "ScalarType? out_dtype, Tensor? bias_) -> Tensor");
   xpu_ops.impl("fp4_gemm", torch::kXPU, &fp4_gemm);

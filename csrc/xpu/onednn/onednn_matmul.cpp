@@ -226,6 +226,26 @@ torch::Tensor fp8_gemm_w8a16(
   return result;
 }
 
+torch::Tensor fp8_gemm_block_decode(
+    const torch::Tensor& A,
+    const torch::Tensor& A_quant,
+    const torch::Tensor& B,
+    const torch::Tensor& A_scale,
+    const torch::Tensor& B_scale) {
+  TORCH_CHECK(A.dim() == 2 && A_quant.dim() == 2 && B.dim() == 2);
+  TORCH_CHECK(A.sizes() == A_quant.sizes());
+  TORCH_CHECK(A.device() == A_quant.device() && A.device() == B.device());
+  TORCH_CHECK(A.scalar_type() == torch::kHalf);
+  TORCH_CHECK(
+      is_supported_fp8(A_quant.scalar_type()) &&
+      A_quant.scalar_type() == B.scalar_type());
+  TORCH_CHECK(A.size(1) == B.size(0));
+  if (A.size(0) == 1) {
+    return fp8_gemm_w8a16(A, B, B_scale, std::nullopt);
+  }
+  return fp8_gemm(A_quant, B, torch::kHalf, A_scale, B_scale, std::nullopt);
+}
+
 torch::Tensor fp4_gemm(
     const torch::Tensor& A,
     const torch::Tensor& B,

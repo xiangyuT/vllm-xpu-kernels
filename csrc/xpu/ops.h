@@ -45,6 +45,16 @@ torch::Tensor fp8_gemm_w8a16(
     const std::optional<torch::Tensor>& B_scale_,
     const std::optional<torch::Tensor>& bias_);
 
+// The model graph keeps dynamic activation quantization for prefill. At
+// single-token decode, dispatch its original FP16 activation to W8A16 while
+// preserving W8A8 for all other token counts.
+torch::Tensor fp8_gemm_block_decode(
+    const torch::Tensor& A,
+    const torch::Tensor& A_quant,
+    const torch::Tensor& B,
+    const torch::Tensor& A_scale,
+    const torch::Tensor& B_scale);
+
 torch::Tensor fp4_gemm(
     const torch::Tensor& A,
     const torch::Tensor& B,
