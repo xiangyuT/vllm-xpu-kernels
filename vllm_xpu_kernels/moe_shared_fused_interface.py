@@ -242,7 +242,10 @@ class XpuMoESharedFusedDecode:
         bufs = self._routing.get(m)
         if bufs is None:
             bufs = (
-                torch.empty(m, self.num_experts, dtype=torch.float32, device=device),
+                torch.empty(m,
+                            self.num_experts,
+                            dtype=torch.float32,
+                            device=device),
                 torch.empty(m, self.top_k, dtype=torch.float32, device=device),
                 torch.empty(m, self.top_k, dtype=torch.int32, device=device),
             )
@@ -254,7 +257,8 @@ class XpuMoESharedFusedDecode:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """route() + forward(); returns (output, topk_ids)."""
         topk_weights, topk_ids = self.route(hidden_states)
-        return self.forward(output, hidden_states, topk_weights, topk_ids), topk_ids
+        out = self.forward(output, hidden_states, topk_weights, topk_ids)
+        return out, topk_ids
 
     def forward_resadd_norm_routed(
         self,
@@ -273,7 +277,8 @@ class XpuMoESharedFusedDecode:
         and the routing run in one kernel. Returns (output, topk_ids).
         """
         assert self.router_weight is not None, "no router_weight given"
-        logits, topk_weights, topk_ids = self._routing_buffers(x.shape[0], x.device)
+        logits, topk_weights, topk_ids = self._routing_buffers(
+            x.shape[0], x.device)
         torch.ops._moe_C.router_resadd_norm_gemv_topk_softmax(
             x,
             residual,
@@ -287,4 +292,5 @@ class XpuMoESharedFusedDecode:
             residual_out,
             self.renormalize,
         )
-        return self.forward(output, normed_out, topk_weights, topk_ids), topk_ids
+        out = self.forward(output, normed_out, topk_weights, topk_ids)
+        return out, topk_ids

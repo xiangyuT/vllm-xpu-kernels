@@ -69,8 +69,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "router_gemv_topk_softmax(Tensor x, Tensor router_weight, Tensor! "
       "logits, Tensor! topk_weights, Tensor! topk_ids, bool renormalize) -> "
       "()");
-  m.impl(
-      "router_gemv_topk_softmax", torch::kXPU, &router_gemv_topk_softmax);
+  m.impl("router_gemv_topk_softmax", torch::kXPU, &router_gemv_topk_softmax);
   // Same with a fused residual-add + Gemma (1 + w) RMSNorm prologue; writes
   // the normed input and the new residual (either may alias its input).
   m.def(

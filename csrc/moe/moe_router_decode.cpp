@@ -359,13 +359,13 @@ class router_kernel {
       // normalizes all rows itself. Group 0 (or the owner) also keeps the
       // normed rows in SLM for the output writer.
       constexpr bool kSplit = kSplitRows;
-      constexpr int kOwn = kSplit ? (MR + kEGroups - 1) / kEGroups : MR;
+      constexpr int kOwnRows = kSplit ? (MR + kEGroups - 1) / kEGroups : MR;
       auto own = [&](int i) { return kSplit ? eg + i * kEGroups : i; };
       const bool has0 = ks < nblk;
       const int k0 = (has0 ? ks : 0) * kBlk;
-      half8 xv0[kOwn], rv0[kOwn];
+      half8 xv0[kOwnRows], rv0[kOwnRows];
 #pragma unroll
-      for (int i = 0; i < kOwn; ++i) {
+      for (int i = 0; i < kOwnRows; ++i) {
         if (own(i) < MR) {  // (uniform per sub-group)
           xv0[i] = sg_load8(sg, a.x + row(own(i)) * a.x_stride + k0);
           rv0[i] = sg_load8(sg, a.residual + row(own(i)) * a.res_stride + k0);
@@ -373,14 +373,14 @@ class router_kernel {
       }
       const half8 gv0 = sg_load8(sg, a.norm_w + k0);
       // Pass 1: this sub-group's share of sum((x + r)^2) of its rows.
-      float ss[kOwn];
+      float ss[kOwnRows];
 #pragma unroll
-      for (int i = 0; i < kOwn; ++i) {
+      for (int i = 0; i < kOwnRows; ++i) {
         ss[i] = own(i) < MR && has0 ? router_sumsq8(xv0[i], rv0[i], 0.f) : 0.f;
       }
       for (int b = ks + kKSplit; b < nblk; b += kKSplit) {  // K > 2048
 #pragma unroll
-        for (int i = 0; i < kOwn; ++i) {
+        for (int i = 0; i < kOwnRows; ++i) {
           if (own(i) < MR) {
             const int k = b * kBlk;
             const half8 xv = sg_load8(sg, a.x + row(own(i)) * a.x_stride + k);
@@ -393,11 +393,11 @@ class router_kernel {
       // s_ssq[ks][m]: the kKSplit sub-groups of a group cover all of K.
       float packed_ss = 0.f;
 #pragma unroll
-      for (int i = 0; i < kOwn; ++i) {
+      for (int i = 0; i < kOwnRows; ++i) {
         const float t = sycl::reduce_over_group(sg, ss[i], sycl::plus<float>());
         packed_ss = lane == i ? t : packed_ss;
       }
-      if ((kSplit || eg == 0) && lane < kOwn && own(lane) < MR) {
+      if ((kSplit || eg == 0) && lane < kOwnRows && own(lane) < MR) {
         s_ssq[ks * MR + own(lane)] = packed_ss;
       }
       sycl::group_barrier(wg);
@@ -410,9 +410,9 @@ class router_kernel {
       }
       half8* s_nv = reinterpret_cast<half8*>(s_nrm);  // [MR][nblk][16]
       const bool keeper = kSplit || eg == 0;
-      float rs[kOwn];
+      float rs[kOwnRows];
 #pragma unroll
-      for (int i = 0; i < kOwn; ++i) {
+      for (int i = 0; i < kOwnRows; ++i) {
         const int m = own(i) < MR ? own(i) : 0;
         const float t = lane < kKSplit ? s_ssq[lane * MR + m] : 0.f;
         rs[i] = sycl::rsqrt(
@@ -423,17 +423,17 @@ class router_kernel {
       // Pass 2: normalize the own rows (MR <= 2: and run the GEMV on them).
       for (int b = ks; b < nblk; b += kKSplit) {
         const int k = b * kBlk;
-        half8 nv[kOwn];
+        half8 nv[kOwnRows];
         if (b == ks) {
 #pragma unroll
-          for (int i = 0; i < kOwn; ++i) {
+          for (int i = 0; i < kOwnRows; ++i) {
             nv[i] = router_norm8(xv0[i], rv0[i], gv0, rs[i]);
           }
         } else {  // K > 2048
           load_w(b);
           const half8 gv = sg_load8(sg, a.norm_w + k);
 #pragma unroll
-          for (int i = 0; i < kOwn; ++i) {
+          for (int i = 0; i < kOwnRows; ++i) {
             if (own(i) < MR) {
               const half8 xv = sg_load8(sg, a.x + row(own(i)) * a.x_stride + k);
               const half8 rv =
@@ -443,7 +443,7 @@ class router_kernel {
           }
         }
 #pragma unroll
-        for (int i = 0; i < kOwn; ++i) {
+        for (int i = 0; i < kOwnRows; ++i) {
           const int m = own(i);
           if (m < MR) {
             if (keeper) s_nv[(m * nblk + b) * kRouterSg + lane] = nv[i];

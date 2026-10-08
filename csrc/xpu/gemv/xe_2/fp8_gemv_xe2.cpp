@@ -37,8 +37,8 @@ struct Fp8GemvKernel {
   Seg seg0;
   Seg seg1;
 
-  [[sycl::reqd_sub_group_size(kSg)]] void operator()(
-      sycl::nd_item<1> item) const {
+  [[sycl::reqd_sub_group_size(kSg)]] void
+  operator()(sycl::nd_item<1> item) const {
 #ifdef __SYCL_DEVICE_ONLY__
     auto* part = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         float[RG * KS * MP * kSg]>(item.get_group());
@@ -54,8 +54,8 @@ struct Fp8GemvKernel {
       // K split, so its lone work-group finishes early instead of forming
       // the kernel's tail.
       if (seg.N - wg_row0 <= (RG / 2) * kRowBlock) {
-        gemv_body<MP, KS * 2, RG / 2>(item, seg, wg_row0, ga, part, M, K,
-                                      none, false);
+        gemv_body<MP, KS * 2, RG / 2>(
+            item, seg, wg_row0, ga, part, M, K, none, false);
         return;
       }
     }
@@ -151,8 +151,8 @@ static inline bool aligned64(const void* p) {
 }
 
 // Activation [.., K] fp16 viewable as [M, K] with a 2D-block-IO legal pitch.
-static bool act_ok(const torch::Tensor& x, int64_t& M, int64_t& K,
-                   int64_t& pitch) {
+static bool
+act_ok(const torch::Tensor& x, int64_t& M, int64_t& K, int64_t& pitch) {
   if (!x.is_xpu() || x.scalar_type() != at::kHalf || x.dim() < 2) return false;
   K = x.size(-1);
   if (K <= 0 || x.stride(-1) != 1) return false;
@@ -168,8 +168,8 @@ static bool act_ok(const torch::Tensor& x, int64_t& M, int64_t& K,
          (pitch * 2) % 16 == 0 && pitch >= K && pitch * 2 < (int64_t(1) << 24);
 }
 
-static bool weight_ok(const torch::Tensor& w, const torch::Tensor& x,
-                      int64_t K) {
+static bool
+weight_ok(const torch::Tensor& w, const torch::Tensor& x, int64_t K) {
   return w.device() == x.device() && w.dim() == 2 &&
          w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.size(1) == K &&
          w.size(0) >= 1 && w.size(0) < (int64_t(1) << 24) && w.stride(1) == 1 &&
@@ -177,8 +177,8 @@ static bool weight_ok(const torch::Tensor& w, const torch::Tensor& x,
          K < (int64_t(1) << 24);
 }
 
-static bool scale_ok(const std::optional<torch::Tensor>& s,
-                     const torch::Tensor& x) {
+static bool
+scale_ok(const std::optional<torch::Tensor>& s, const torch::Tensor& x) {
   return s.has_value() && s->device() == x.device() &&
          s->scalar_type() == at::kFloat && s->numel() == 1;
 }
@@ -215,8 +215,8 @@ bool fp8_gemv_w8a16_supported_nt(
   return fp8_gemv_w8a16_supported(a, b_kn.t(), scale, bias);
 }
 
-static void check_common(const torch::Tensor& x, int64_t& M, int64_t& K,
-                         int64_t& pitch) {
+static void
+check_common(const torch::Tensor& x, int64_t& M, int64_t& K, int64_t& pitch) {
   TORCH_CHECK(x.is_xpu(), "fp8_gemv: x must be an XPU tensor");
   TORCH_CHECK(x.scalar_type() == at::kHalf, "fp8_gemv: x must be float16");
   TORCH_CHECK(x.dim() >= 2, "fp8_gemv: x must be at least 2-D");
@@ -225,25 +225,44 @@ static void check_common(const torch::Tensor& x, int64_t& M, int64_t& K,
       act_ok(x, M, K, pitch),
       "fp8_gemv: x must be viewable as [M<=8, K] with 64 B aligned base and a "
       "16 B multiple row pitch (got shape ",
-      x.sizes(), ", strides ", x.strides(), ")");
+      x.sizes(),
+      ", strides ",
+      x.strides(),
+      ")");
 }
 
-static void check_weight(const torch::Tensor& w, const torch::Tensor& s,
-                         const torch::Tensor& x, int64_t K, const char* name) {
+static void check_weight(
+    const torch::Tensor& w,
+    const torch::Tensor& s,
+    const torch::Tensor& x,
+    int64_t K,
+    const char* name) {
   TORCH_CHECK(w.device() == x.device(), "fp8_gemv: ", name, " device mismatch");
   TORCH_CHECK(
-      w.scalar_type() == at::ScalarType::Float8_e4m3fn, "fp8_gemv: ", name,
+      w.scalar_type() == at::ScalarType::Float8_e4m3fn,
+      "fp8_gemv: ",
+      name,
       " must be float8_e4m3fn");
   TORCH_CHECK(
-      w.dim() == 2 && w.size(1) == K, "fp8_gemv: ", name, " must be [N, K=", K,
-      "], got ", w.sizes());
+      w.dim() == 2 && w.size(1) == K,
+      "fp8_gemv: ",
+      name,
+      " must be [N, K=",
+      K,
+      "], got ",
+      w.sizes());
   TORCH_CHECK(
-      w.stride(1) == 1 && w.stride(0) == K, "fp8_gemv: ", name,
+      w.stride(1) == 1 && w.stride(0) == K,
+      "fp8_gemv: ",
+      name,
       " must be row-major contiguous [N, K]");
-  TORCH_CHECK(aligned64(w.data_ptr()), "fp8_gemv: ", name, " must be 64 B aligned");
   TORCH_CHECK(
-      K % kChunkK == 0 && K < (int64_t(1) << 24), "fp8_gemv: K must be a "
-      "multiple of 64, got ", K);
+      aligned64(w.data_ptr()), "fp8_gemv: ", name, " must be 64 B aligned");
+  TORCH_CHECK(
+      K % kChunkK == 0 && K < (int64_t(1) << 24),
+      "fp8_gemv: K must be a "
+      "multiple of 64, got ",
+      K);
   TORCH_CHECK(w.size(0) < (int64_t(1) << 24), "fp8_gemv: N too large");
   TORCH_CHECK(
       s.device() == x.device() && s.scalar_type() == at::kFloat &&
@@ -269,10 +288,21 @@ torch::Tensor fp8_gemv_w8a16(
   const int64_t N = w.size(0);
   auto out = at::empty(out_shape(x, N), x.options());
   auto& q = vllm::xpu::vllmGetQueue();
-  Seg s0{reinterpret_cast<const uint8_t*>(w.data_ptr()), scale.data_ptr<float>(),
-         reinterpret_cast<sycl::half*>(out.data_ptr()), int(N), int(N), 0};
-  run_gemv<1>(q, reinterpret_cast<const sycl::half*>(x.data_ptr()),
-              int(pitch * 2), int(M), int(K), s0, s0);
+  Seg s0{
+      reinterpret_cast<const uint8_t*>(w.data_ptr()),
+      scale.data_ptr<float>(),
+      reinterpret_cast<sycl::half*>(out.data_ptr()),
+      int(N),
+      int(N),
+      0};
+  run_gemv<1>(
+      q,
+      reinterpret_cast<const sycl::half*>(x.data_ptr()),
+      int(pitch * 2),
+      int(M),
+      int(K),
+      s0,
+      s0);
   return out;
 }
 
@@ -291,14 +321,28 @@ std::tuple<torch::Tensor, torch::Tensor> fp8_gemv2_w8a16(
   auto out1 = at::empty(out_shape(x, N1), x.options());
   auto out2 = at::empty(out_shape(x, N2), x.options());
   auto& q = vllm::xpu::vllmGetQueue();
-  Seg s0{reinterpret_cast<const uint8_t*>(w1.data_ptr()),
-         scale1.data_ptr<float>(),
-         reinterpret_cast<sycl::half*>(out1.data_ptr()), int(N1), int(N1), 0};
-  Seg s1{reinterpret_cast<const uint8_t*>(w2.data_ptr()),
-         scale2.data_ptr<float>(),
-         reinterpret_cast<sycl::half*>(out2.data_ptr()), int(N2), int(N2), 0};
-  run_gemv<2>(q, reinterpret_cast<const sycl::half*>(x.data_ptr()),
-              int(pitch * 2), int(M), int(K), s0, s1);
+  Seg s0{
+      reinterpret_cast<const uint8_t*>(w1.data_ptr()),
+      scale1.data_ptr<float>(),
+      reinterpret_cast<sycl::half*>(out1.data_ptr()),
+      int(N1),
+      int(N1),
+      0};
+  Seg s1{
+      reinterpret_cast<const uint8_t*>(w2.data_ptr()),
+      scale2.data_ptr<float>(),
+      reinterpret_cast<sycl::half*>(out2.data_ptr()),
+      int(N2),
+      int(N2),
+      0};
+  run_gemv<2>(
+      q,
+      reinterpret_cast<const sycl::half*>(x.data_ptr()),
+      int(pitch * 2),
+      int(M),
+      int(K),
+      s0,
+      s1);
   return {out1, out2};
 }
 
@@ -324,13 +368,16 @@ std::tuple<torch::Tensor, torch::Tensor> fp8_gemm_w8a16_pair(
       fp8_gemv_w8a16_supported_nt(a, b2_kn, scale2, std::nullopt))
     return fp8_gemv2_w8a16(a, b1_kn.t(), scale1, b2_kn.t(), scale2);
   using Sig = torch::Tensor(
-      const torch::Tensor&, const torch::Tensor&,
-      const std::optional<torch::Tensor>&, const std::optional<torch::Tensor>&);
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const std::optional<torch::Tensor>&,
+      const std::optional<torch::Tensor>&);
   static auto gemm = c10::Dispatcher::singleton()
                          .findSchemaOrThrow("_xpu_C::fp8_gemm_w8a16", "")
                          .typed<Sig>();
-  return {gemm.call(a, b1_kn, scale1, std::nullopt),
-          gemm.call(a, b2_kn, scale2, std::nullopt)};
+  return {
+      gemm.call(a, b1_kn, scale1, std::nullopt),
+      gemm.call(a, b2_kn, scale2, std::nullopt)};
 }
 
 // Drop-in for the fp8_gemm_w8a16(A, B=[K,N] NT view, B_scale, bias) entry:
@@ -343,8 +390,10 @@ torch::Tensor fp8_gemm_w8a16_dispatch(
   if (fp8_gemv_w8a16_supported_nt(a, b_kn, scale, bias))
     return fp8_gemv_w8a16(a, b_kn.t(), *scale);
   using Sig = torch::Tensor(
-      const torch::Tensor&, const torch::Tensor&,
-      const std::optional<torch::Tensor>&, const std::optional<torch::Tensor>&);
+      const torch::Tensor&,
+      const torch::Tensor&,
+      const std::optional<torch::Tensor>&,
+      const std::optional<torch::Tensor>&);
   static auto fallback = c10::Dispatcher::singleton()
                              .findSchemaOrThrow("_xpu_C::fp8_gemm_w8a16", "")
                              .typed<Sig>();

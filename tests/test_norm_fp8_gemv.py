@@ -48,7 +48,8 @@ def test_resadd_rmsnorm_fp8_gemm(m):
     r = torch.randn(m, 2048, device=DEVICE, dtype=torch.float16)
     nw = torch.randn(2048, device=DEVICE, dtype=torch.float16) * 0.1
     w, s = _w(4608, 2048), torch.tensor([0.02], device=DEVICE)
-    out, r_out = torch.ops._xpu_C.resadd_rmsnorm_fp8_gemm(x, r, nw, EPS, w.t(), s)
+    out, r_out = torch.ops._xpu_C.resadd_rmsnorm_fp8_gemm(
+        x, r, nw, EPS, w.t(), s)
     y, t = _resadd_ref(x, r, nw)
     torch.testing.assert_close(r_out, t, atol=0, rtol=0)
     torch.testing.assert_close(out, _lin(y, w, s), atol=3e-3, rtol=2e-2)

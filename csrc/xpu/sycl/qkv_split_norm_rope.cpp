@@ -215,10 +215,9 @@ void launch_qkv_split_norm_rope(
   const int s0 = is_mrope ? mrope_section[0] : 0;
   const int s1 = is_mrope ? mrope_section[1] : 0;
   const int s2 = is_mrope ? mrope_section[2] : 0;
-  T* gate_ptr =
-      gate_out.has_value()
-          ? reinterpret_cast<T*>(gate_out->data_ptr<scalar_t>())
-          : nullptr;
+  T* gate_ptr = gate_out.has_value()
+                    ? reinterpret_cast<T*>(gate_out->data_ptr<scalar_t>())
+                    : nullptr;
 
   auto& queue = vllm::xpu::vllmGetQueue();
   sycl::range<2> local(1, kQkvSgSize);
@@ -253,13 +252,13 @@ void launch_qkv_split_norm_rope(
 }  // namespace vllm
 
 void qkv_split_norm_rope(
-    const torch::Tensor& qkv,            // [T, W]
-    const torch::Tensor& positions,      // int64 [T] or [3, T]
-    const torch::Tensor& q_weight,       // [D]
-    const torch::Tensor& k_weight,       // [D]
-    const torch::Tensor& cos_sin_cache,  // [max_pos, rotary_dim]
-    torch::Tensor& q_out,                // [T, Hq * D]
-    torch::Tensor& k_out,                // [T, Hk * D]
+    const torch::Tensor& qkv,                      // [T, W]
+    const torch::Tensor& positions,                // int64 [T] or [3, T]
+    const torch::Tensor& q_weight,                 // [D]
+    const torch::Tensor& k_weight,                 // [D]
+    const torch::Tensor& cos_sin_cache,            // [max_pos, rotary_dim]
+    torch::Tensor& q_out,                          // [T, Hq * D]
+    torch::Tensor& k_out,                          // [T, Hk * D]
     const std::optional<torch::Tensor>& gate_out,  // [T, Hq * D] if gated
     int64_t num_q_heads,
     int64_t num_kv_heads,
@@ -275,7 +274,9 @@ void qkv_split_norm_rope(
       dtype == at::kHalf || dtype == at::kBFloat16,
       "qkv_split_norm_rope: qkv must be fp16 or bf16");
   for (const torch::Tensor* t :
-       {&q_weight, &k_weight, &cos_sin_cache,
+       {&q_weight,
+        &k_weight,
+        &cos_sin_cache,
         static_cast<const torch::Tensor*>(&q_out),
         static_cast<const torch::Tensor*>(&k_out)})
     TORCH_CHECK(
@@ -335,14 +336,38 @@ void qkv_split_norm_rope(
   VLLM_DISPATCH_HALF_TYPES(dtype, "qkv_split_norm_rope", [&] {
     if (head_dim == 256) {
       vllm::launch_qkv_split_norm_rope<scalar_t, 256>(
-          qkv, positions, q_weight, k_weight, cos_sin_cache, q_out, k_out,
-          gate_out, num_q_heads, num_kv_heads, rotary_dim, eps, weight_offset,
-          mrope_section, mrope_interleaved);
+          qkv,
+          positions,
+          q_weight,
+          k_weight,
+          cos_sin_cache,
+          q_out,
+          k_out,
+          gate_out,
+          num_q_heads,
+          num_kv_heads,
+          rotary_dim,
+          eps,
+          weight_offset,
+          mrope_section,
+          mrope_interleaved);
     } else {
       vllm::launch_qkv_split_norm_rope<scalar_t, 128>(
-          qkv, positions, q_weight, k_weight, cos_sin_cache, q_out, k_out,
-          gate_out, num_q_heads, num_kv_heads, rotary_dim, eps, weight_offset,
-          mrope_section, mrope_interleaved);
+          qkv,
+          positions,
+          q_weight,
+          k_weight,
+          cos_sin_cache,
+          q_out,
+          k_out,
+          gate_out,
+          num_q_heads,
+          num_kv_heads,
+          rotary_dim,
+          eps,
+          weight_offset,
+          mrope_section,
+          mrope_interleaved);
     }
   });
 }

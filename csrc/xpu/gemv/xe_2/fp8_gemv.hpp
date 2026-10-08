@@ -39,10 +39,10 @@
 
 namespace vllm::fp8_gemv {
 
-constexpr int kSg = 16;           // sub-group size
-constexpr int kRowBlock = 16;     // W rows per sub-group (= DPAS N)
-constexpr int kStepK = 32;        // K per step (one even + one odd DPAS)
-constexpr int kChunkSteps = 2;    // steps per chunk
+constexpr int kSg = 16;         // sub-group size
+constexpr int kRowBlock = 16;   // W rows per sub-group (= DPAS N)
+constexpr int kStepK = 32;      // K per step (one even + one odd DPAS)
+constexpr int kChunkSteps = 2;  // steps per chunk
 constexpr int kChunkK = kStepK * kChunkSteps;  // 64
 constexpr int kMaxM = 8;
 constexpr float kE4M3DecodeScale = 256.f;  // undo the 2^-8 of the bit decode
@@ -117,8 +117,8 @@ struct AOps {
 };
 
 template <int MP>
-static inline void a_from_dwords(
-    const uint32_t (&ab)[kChunkSteps][MP], AOps<MP>& A) {
+static inline void
+a_from_dwords(const uint32_t (&ab)[kChunkSteps][MP], AOps<MP>& A) {
 #pragma unroll
   for (int t = 0; t < kChunkSteps; ++t)
 #pragma unroll
@@ -139,7 +139,7 @@ static inline void load_w_chunk(
     int kc,
     u32x8 (&wr)[kChunkSteps]) {
 #ifdef __SYCL_DEVICE_ONLY__
-#pragma unroll
+  #pragma unroll
   for (int t = 0; t < kChunkSteps; ++t) {
     cute::intel::coord_t co;
     co[0] = (kc + t * kStepK) / 4;  // in dwords
@@ -154,15 +154,10 @@ static inline void load_w_chunk(
 // dwords; lane j of row m = a[m, kc + 32 t + 2 j .. + 1]. Rows >= M read 0.
 template <int MP>
 static inline void load_a_global(
-    const sycl::half* a,
-    int K,
-    int M,
-    int pitch_bytes,
-    int kc,
-    AOps<MP>& A) {
+    const sycl::half* a, int K, int M, int pitch_bytes, int kc, AOps<MP>& A) {
 #ifdef __SYCL_DEVICE_ONLY__
   uint32_t ab[kChunkSteps][MP];
-#pragma unroll
+  #pragma unroll
   for (int t = 0; t < kChunkSteps; ++t) {
     cute::intel::coord_t co;
     co[0] = (kc + t * kStepK) / 2;  // in dwords
@@ -186,10 +181,7 @@ static inline int slm_a_dword(int m, int k) {
 
 template <int MP>
 static inline void load_a_slm(
-    const sycl::sub_group& sg,
-    const uint32_t* slm_a,
-    int kc,
-    AOps<MP>& A) {
+    const sycl::sub_group& sg, const uint32_t* slm_a, int kc, AOps<MP>& A) {
   uint32_t ab[kChunkSteps][MP];
 #pragma unroll
   for (int t = 0; t < kChunkSteps; ++t) {
@@ -202,7 +194,8 @@ static inline void load_a_slm(
     } else {
       const sycl::vec<uint32_t, MP> u = sg.load<MP>(lp);
 #pragma unroll
-      for (int m = 0; m < MP; ++m) ab[t][m] = u[m];
+      for (int m = 0; m < MP; ++m)
+        ab[t][m] = u[m];
     }
   }
   a_from_dwords<MP>(ab, A);
@@ -213,16 +206,16 @@ template <int MP>
 struct GlobalA {
   const sycl::half* a;
   int K, M, pitch_bytes;
-  inline void operator()(const sycl::sub_group&, int kc, int,
-                         AOps<MP>& A) const {
+  inline void
+  operator()(const sycl::sub_group&, int kc, int, AOps<MP>& A) const {
     load_a_global<MP>(a, K, M, pitch_bytes, kc, A);
   }
 };
 template <int MP>
 struct SlmA {
   const uint32_t* slm_a;
-  inline void operator()(const sycl::sub_group& sg, int kc, int,
-                         AOps<MP>& A) const {
+  inline void
+  operator()(const sycl::sub_group& sg, int kc, int, AOps<MP>& A) const {
     load_a_slm<MP>(sg, slm_a, kc, A);
   }
 };
@@ -235,10 +228,10 @@ static inline void compute_chunk(
     typename Dpas<MP>::C& acc_even,
     typename Dpas<MP>::C& acc_odd) {
 #ifdef __SYCL_DEVICE_ONLY__
-#pragma unroll
+  #pragma unroll
   for (int t = 0; t < kChunkSteps; ++t) {
     cute::intel::int8 be, bo;
-#pragma unroll
+  #pragma unroll
     for (int i = 0; i < 8; ++i) {
       be[i] = int(e4m3_even(wr[t][i]));
       bo[i] = int(e4m3_odd(wr[t][i]));
@@ -256,7 +249,7 @@ struct Seg {
   sycl::half* out;     // [M, N], row stride out_stride (elements)
   int N;
   int out_stride;
-  int wg_begin;        // first work-group of this segment
+  int wg_begin;  // first work-group of this segment
 };
 
 // K-chunk ownership: iteration i of K-split sub-group ks handles chunk
@@ -305,7 +298,7 @@ static inline void gemv_body(
     vset<MP>(acc_e, i, 0.f);
     vset<MP>(acc_o, i, 0.f);
   }
-  auto step = [&](int it, int c, const u32x8 (&wr)[kChunkSteps]) {
+  auto step = [&](int it, int c, const u32x8(&wr)[kChunkSteps]) {
     AOps<MP> A;
     load_a_fn(sg, c * kChunkK, it, A);
     compute_chunk<MP>(wr, A, acc_e, acc_o);
@@ -398,7 +391,8 @@ static inline void gemv_body(
         if (n0 + RG <= seg.N && (seg.out_stride % RG) == 0) {
           sycl::vec<sycl::half, RG> hv;
 #pragma unroll
-          for (int u = 0; u < RG; ++u) hv[u] = sycl::half(v[u]);
+          for (int u = 0; u < RG; ++u)
+            hv[u] = sycl::half(v[u]);
           *reinterpret_cast<sycl::vec<sycl::half, RG>*>(o) = hv;
         } else {
 #pragma unroll
@@ -414,11 +408,7 @@ static inline void gemv_body(
 // gemv_body(..., wpre, true); returns false if the rows are out of range.
 template <int PRE, int KS>
 static inline bool preload_w(
-    const Seg& seg,
-    int row0,
-    int ks,
-    int K,
-    u32x8 (&wpre)[PRE][kChunkSteps]) {
+    const Seg& seg, int row0, int ks, int K, u32x8 (&wpre)[PRE][kChunkSteps]) {
   if (row0 >= seg.N) return false;
   const int nchunks = K / kChunkK;
 #pragma unroll
@@ -448,7 +438,8 @@ static inline void stage_a_slm(
     sycl::vec<uint32_t, 4> v(0u);
     if (m < M)
       v = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(a + m * pitch + k);
-    *reinterpret_cast<sycl::vec<uint32_t, 4>*>(slm_a + slm_a_dword<MP>(m, k)) = v;
+    *reinterpret_cast<sycl::vec<uint32_t, 4>*>(slm_a + slm_a_dword<MP>(m, k)) =
+        v;
   }
 }
 
