@@ -1,8 +1,0 @@
-{
-  "source_sha256": "2a3cfb82e680e6eaffaf39ebf73bdacc571d8ed85851069bceb60f0e00619df2",
-  "generated_sha256": "8630dfd8fbd23d576708b39761fd004e4e0d2a3f2b7618a03138249fcad4084e",
-  "library_sha256": "6f4d0ec1c0fa8177daa874f84355cff138101c12cae6308aeff15333650bc7b9",
-  "namespace": "vllm::moe_m16",
-  "entrypoints": "minicpm_m16_*",
-  "gpu_execution": false
-}
