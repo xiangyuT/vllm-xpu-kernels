@@ -51,14 +51,17 @@ namespace vllm::fp8_gemv {
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
-static inline uint16_t half_bits(float v) {
-  return sycl::bit_cast<uint16_t>(sycl::half(v));
+template <typename Scalar>
+static inline uint16_t scalar_bits(float v) {
+  return sycl::bit_cast<uint16_t>(Scalar(v));
 }
+template <typename Scalar>
 static inline float lo_f(uint32_t d) {
-  return float(sycl::bit_cast<sycl::half>(uint16_t(d & 0xFFFFu)));
+  return float(sycl::bit_cast<Scalar>(uint16_t(d & 0xFFFFu)));
 }
+template <typename Scalar>
 static inline float hi_f(uint32_t d) {
-  return float(sycl::bit_cast<sycl::half>(uint16_t(d >> 16)));
+  return float(sycl::bit_cast<Scalar>(uint16_t(d >> 16)));
 }
 static inline float silu(float v) { return v / (1.f + sycl::exp(-v)); }
 // prologue-side silu (hidden behind the weight preloads / barrier)
@@ -68,11 +71,11 @@ static inline float silu_fast(float v) {
 
 // --------------------------------------------------- gated RMSNorm A -----
 // x, z: [M, H, D] fp16 with strides (s_m, s_h, 1); w_norm [D] fp16.
-template <int MP>
+template <int MP, typename Scalar>
 struct GatedNormA {
-  const sycl::half* x;
-  const sycl::half* z;
-  const sycl::half* wn;
+  const Scalar* x;
+  const Scalar* z;
+  const Scalar* wn;
   int64_t xs_m, xs_h, zs_m, zs_h;
   int D;
   int M;
@@ -93,8 +96,8 @@ struct GatedNormA {
         }
         continue;
       }
-      const sycl::half* xh = x + m * xs_m + h * xs_h;
-      const sycl::half* zh = z + m * zs_m + h * zs_h;
+      const Scalar* xh = x + m * xs_m + h * xs_h;
+      const Scalar* zh = z + m * zs_m + h * zs_h;
       // head statistics: lane covers 16 B vectors lane, lane + 16, ...
       float ss = 0.f;
       for (int v = lane; v < D / 8; v += kSg) {
@@ -102,7 +105,7 @@ struct GatedNormA {
             reinterpret_cast<const sycl::vec<uint32_t, 4>*>(xh)[v];
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
-          const float a = lo_f(q4[q]), b = hi_f(q4[q]);
+          const float a = lo_f<Scalar>(q4[q]), b = hi_f<Scalar>(q4[q]);
           ss = sycl::fma(a, a, ss);
           ss = sycl::fma(b, b, ss);
         }
@@ -115,10 +118,12 @@ struct GatedNormA {
         const uint32_t xv = *reinterpret_cast<const uint32_t*>(xh + d);
         const uint32_t zv = *reinterpret_cast<const uint32_t*>(zh + d);
         const uint32_t wv = *reinterpret_cast<const uint32_t*>(wn + d);
-        const float y0 = lo_f(xv) * rstd * lo_f(wv) * silu(lo_f(zv));
-        const float y1 = hi_f(xv) * rstd * hi_f(wv) * silu(hi_f(zv));
-        vset<MP>(A.e[t], m, short(half_bits(y0)));
-        vset<MP>(A.o[t], m, short(half_bits(y1)));
+        const float y0 =
+            lo_f<Scalar>(xv) * rstd * lo_f<Scalar>(wv) * silu(lo_f<Scalar>(zv));
+        const float y1 =
+            hi_f<Scalar>(xv) * rstd * hi_f<Scalar>(wv) * silu(hi_f<Scalar>(zv));
+        vset<MP>(A.e[t], m, short(scalar_bits<Scalar>(y0)));
+        vset<MP>(A.o[t], m, short(scalar_bits<Scalar>(y1)));
       }
     }
   }
@@ -127,11 +132,11 @@ struct GatedNormA {
 // ------------------------------------------ residual-add Gemma RMSNorm A -----
 // x, r: [M, K] fp16 (row strides xs, rs); w_norm [K] fp16; rstd[m] from the
 // work-group prologue.
-template <int MP>
+template <int MP, typename Scalar>
 struct ResAddNormA {
-  const sycl::half* x;
-  const sycl::half* r;
-  const sycl::half* wn;
+  const Scalar* x;
+  const Scalar* r;
+  const Scalar* wn;
   int64_t xs, rs;
   const float* rstd;  // SLM, [MP]
   int M;
@@ -143,7 +148,7 @@ struct ResAddNormA {
     for (int t = 0; t < kChunkSteps; ++t) {
       const int k = kc + t * kStepK + 2 * lane;
       const uint32_t wv = *reinterpret_cast<const uint32_t*>(wn + k);
-      const float w0 = lo_f(wv) + 1.f, w1 = hi_f(wv) + 1.f;
+      const float w0 = lo_f<Scalar>(wv) + 1.f, w1 = hi_f<Scalar>(wv) + 1.f;
 #pragma unroll
       for (int m = 0; m < MP; ++m) {
         if (m < M) {
@@ -152,10 +157,10 @@ struct ResAddNormA {
           const uint32_t rv =
               *reinterpret_cast<const uint32_t*>(r + m * rs + k);
           const float rs_m = rstd[m];
-          const float y0 = (lo_f(xv) + lo_f(rv)) * rs_m * w0;
-          const float y1 = (hi_f(xv) + hi_f(rv)) * rs_m * w1;
-          vset<MP>(A.e[t], m, short(half_bits(y0)));
-          vset<MP>(A.o[t], m, short(half_bits(y1)));
+          const float y0 = (lo_f<Scalar>(xv) + lo_f<Scalar>(rv)) * rs_m * w0;
+          const float y1 = (hi_f<Scalar>(xv) + hi_f<Scalar>(rv)) * rs_m * w1;
+          vset<MP>(A.e[t], m, short(scalar_bits<Scalar>(y0)));
+          vset<MP>(A.o[t], m, short(scalar_bits<Scalar>(y1)));
         } else {
           vset<MP>(A.e[t], m, short(0));
           vset<MP>(A.o[t], m, short(0));
@@ -170,10 +175,10 @@ struct ResAddNormA {
 // 3+ spills with 128 GRF).
 constexpr int NPRE = 2;
 
-template <int MP, int KS, int RG>
+template <int MP, int KS, int RG, typename Scalar>
 struct GatedNormGemvKernel {
-  GatedNormA<MP> ga;
-  Seg seg;
+  GatedNormA<MP, Scalar> ga;
+  Seg<Scalar> seg;
   int K;
 
   [[sycl::reqd_sub_group_size(kSg)]] void
@@ -196,16 +201,16 @@ struct GatedNormGemvKernel {
   }
 };
 
-template <int MP, int KS, int RG, int NSEG>
+template <int MP, int KS, int RG, int NSEG, typename Scalar>
 struct ResAddNormGemvKernel {
-  const sycl::half* x;
-  const sycl::half* r;
-  const sycl::half* wn;
-  sycl::half* r_out;
+  const Scalar* x;
+  const Scalar* r;
+  const Scalar* wn;
+  Scalar* r_out;
   int64_t xs, rs, ros;
   int M, K;
   float eps;
-  Seg seg0, seg1;
+  Seg<Scalar> seg0, seg1;
 
   [[sycl::reqd_sub_group_size(kSg)]] void
   operator()(sycl::nd_item<1> item) const {
@@ -221,7 +226,7 @@ struct ResAddNormGemvKernel {
     const int ks = sgid % KS, rg = sgid / KS;
     const int g = int(item.get_group(0));
     const bool second = NSEG == 2 && g >= seg1.wg_begin;
-    const Seg& seg = second ? seg1 : seg0;
+    const Seg<Scalar>& seg = second ? seg1 : seg0;
     const int wg_row0 = (g - seg.wg_begin) * RG * kRowBlock;
     const int row0 = wg_row0 + rg * kRowBlock;
 
@@ -261,11 +266,12 @@ struct ResAddNormGemvKernel {
             u32x4 o;
   #pragma unroll
             for (int q = 0; q < 4; ++q) {
-              const float t0 = lo_f(xv[i][q]) + lo_f(rv[i][q]);
-              const float t1 = hi_f(xv[i][q]) + hi_f(rv[i][q]);
+              const float t0 = lo_f<Scalar>(xv[i][q]) + lo_f<Scalar>(rv[i][q]);
+              const float t1 = hi_f<Scalar>(xv[i][q]) + hi_f<Scalar>(rv[i][q]);
               ss = sycl::fma(t0, t0, ss);
               ss = sycl::fma(t1, t1, ss);
-              o[q] = uint32_t(half_bits(t0)) | (uint32_t(half_bits(t1)) << 16);
+              o[q] = uint32_t(scalar_bits<Scalar>(t0)) |
+                     (uint32_t(scalar_bits<Scalar>(t1)) << 16);
             }
             const int v = v0 + i * kSg + lane;
             if (write_res && v < v_end) op[v] = o;
@@ -284,8 +290,8 @@ struct ResAddNormGemvKernel {
     }
     sycl::group_barrier(item.get_group());
 
-    const ResAddNormA<MP> la{x, r, wn, xs, rs, stat + NSG * MP, M};
-    gemv_body<MP, KS, RG, ResAddNormA<MP>, NPRE>(
+    const ResAddNormA<MP, Scalar> la{x, r, wn, xs, rs, stat + NSG * MP, M};
+    gemv_body<MP, KS, RG, ResAddNormA<MP, Scalar>, NPRE>(
         item, seg, wg_row0, la, part, M, K, wpre, pre);
 #endif
   }
@@ -300,10 +306,10 @@ struct ResAddNormGemvKernel {
 // statistics reduction and forms the A operands from registers. Activation
 // loads are issued before the weight preloads (16 send tokens per thread),
 // otherwise they queue behind DRAM latency.
-template <int CPS>
+template <int CPS, typename Scalar>
 static inline void load_chunks(
-    const sycl::half* base,  // first chunk of this sub-group
-    int64_t pitch_elems,     // element stride between its chunks
+    const Scalar* base,   // first chunk of this sub-group
+    int64_t pitch_elems,  // element stride between its chunks
     uint32_t (&d)[CPS][kChunkSteps]) {
 #ifdef __SYCL_DEVICE_ONLY__
   uint32_t v[kChunkSteps][CPS];
@@ -323,11 +329,9 @@ static inline void load_chunks(
 #endif
 }
 
-template <int CPS>
+template <int CPS, typename Scalar>
 static inline void store_chunks(
-    sycl::half* base,
-    int64_t pitch_elems,
-    const uint32_t (&d)[CPS][kChunkSteps]) {
+    Scalar* base, int64_t pitch_elems, const uint32_t (&d)[CPS][kChunkSteps]) {
 #ifdef __SYCL_DEVICE_ONLY__
   uint32_t v[kChunkSteps][CPS];
   #pragma unroll
@@ -359,7 +363,7 @@ struct GateF {
   float g[CPS][kChunkSteps][2];
 };
 
-template <int CPS>
+template <int CPS, typename Scalar>
 struct ResAddRegA {
   const RegA<CPS>* d;
   inline void
@@ -367,15 +371,17 @@ struct ResAddRegA {
 #pragma unroll
     for (int t = 0; t < kChunkSteps; ++t) {
       const uint32_t xv = d->xd[it][t], rv = d->gd[it][t], wv = d->wd[it][t];
-      const float y0 = (lo_f(xv) + lo_f(rv)) * d->rstd[0] * (lo_f(wv) + 1.f);
-      const float y1 = (hi_f(xv) + hi_f(rv)) * d->rstd[0] * (hi_f(wv) + 1.f);
-      A.e[t] = short(half_bits(y0));
-      A.o[t] = short(half_bits(y1));
+      const float y0 = (lo_f<Scalar>(xv) + lo_f<Scalar>(rv)) * d->rstd[0] *
+                       (lo_f<Scalar>(wv) + 1.f);
+      const float y1 = (hi_f<Scalar>(xv) + hi_f<Scalar>(rv)) * d->rstd[0] *
+                       (hi_f<Scalar>(wv) + 1.f);
+      A.e[t] = short(scalar_bits<Scalar>(y0));
+      A.o[t] = short(scalar_bits<Scalar>(y1));
     }
   }
 };
 
-template <int CPS>
+template <int CPS, typename Scalar>
 struct GatedRegA {
   const RegA<CPS>* d;
   const GateF<CPS>* gf;
@@ -384,23 +390,23 @@ struct GatedRegA {
 #pragma unroll
     for (int t = 0; t < kChunkSteps; ++t) {
       const uint32_t xv = d->xd[it][t];
-      const float y0 = lo_f(xv) * d->rstd[it] * gf->g[it][t][0];
-      const float y1 = hi_f(xv) * d->rstd[it] * gf->g[it][t][1];
-      A.e[t] = short(half_bits(y0));
-      A.o[t] = short(half_bits(y1));
+      const float y0 = lo_f<Scalar>(xv) * d->rstd[it] * gf->g[it][t][0];
+      const float y1 = hi_f<Scalar>(xv) * d->rstd[it] * gf->g[it][t][1];
+      A.e[t] = short(scalar_bits<Scalar>(y0));
+      A.o[t] = short(scalar_bits<Scalar>(y1));
     }
   }
 };
 
-template <int KS, int NSEG, int CPS>
+template <int KS, int NSEG, int CPS, typename Scalar>
 struct ResAddNormGemvRegKernel {
-  const sycl::half* x;
-  const sycl::half* r;
-  const sycl::half* wn;
-  sycl::half* r_out;
+  const Scalar* x;
+  const Scalar* r;
+  const Scalar* wn;
+  Scalar* r_out;
   int K;
   float eps;
-  Seg seg0, seg1;
+  Seg<Scalar> seg0, seg1;
 
   [[sycl::reqd_sub_group_size(kSg)]] void
   operator()(sycl::nd_item<1> item) const {
@@ -416,7 +422,7 @@ struct ResAddNormGemvRegKernel {
     const int ks = sg.get_group_linear_id();
     const int g = int(item.get_group(0));
     const bool second = NSEG == 2 && g >= seg1.wg_begin;
-    const Seg& seg = second ? seg1 : seg0;
+    const Seg<Scalar>& seg = second ? seg1 : seg0;
     const int row0 = (g - seg.wg_begin) * kRowBlock;
 
     constexpr int64_t kPitch = int64_t(KS) * kChunkK;  // between own chunks
@@ -434,11 +440,12 @@ struct ResAddNormGemvRegKernel {
     for (int i = 0; i < CPS; ++i)
   #pragma unroll
       for (int t = 0; t < kChunkSteps; ++t) {
-        const float t0 = lo_f(d.xd[i][t]) + lo_f(d.gd[i][t]);
-        const float t1 = hi_f(d.xd[i][t]) + hi_f(d.gd[i][t]);
+        const float t0 = lo_f<Scalar>(d.xd[i][t]) + lo_f<Scalar>(d.gd[i][t]);
+        const float t1 = hi_f<Scalar>(d.xd[i][t]) + hi_f<Scalar>(d.gd[i][t]);
         ss = sycl::fma(t0, t0, ss);
         ss = sycl::fma(t1, t1, ss);
-        td[i][t] = uint32_t(half_bits(t0)) | (uint32_t(half_bits(t1)) << 16);
+        td[i][t] = uint32_t(scalar_bits<Scalar>(t0)) |
+                   (uint32_t(scalar_bits<Scalar>(t1)) << 16);
       }
     if (g == 0) store_chunks<CPS>(r_out + e0, kPitch, td);  // residual_out
     ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
@@ -450,8 +457,8 @@ struct ResAddNormGemvRegKernel {
       tot += stat[q];
     d.rstd[0] = sycl::rsqrt(tot / float(K) + eps);
 
-    const ResAddRegA<CPS> la{&d};
-    gemv_body<1, KS, 1, ResAddRegA<CPS>, NPRE, CPS>(
+    const ResAddRegA<CPS, Scalar> la{&d};
+    gemv_body<1, KS, 1, ResAddRegA<CPS, Scalar>, NPRE, CPS>(
         item, seg, row0, la, part, 1, K, wpre, pre);
 #endif
   }
@@ -462,15 +469,15 @@ struct ResAddNormGemvRegKernel {
 // KS / CPH heads apart. The sub-group also loads the other CPH - 1 chunks of
 // each of its heads (x only), so head statistics need no cross-sub-group
 // exchange (no SLM, no barrier).
-template <int KS, int CPS, int CPH>
+template <int KS, int CPS, int CPH, typename Scalar>
 struct GatedNormGemvRegKernel {
-  const sycl::half* x;
-  const sycl::half* z;
-  const sycl::half* wn;
+  const Scalar* x;
+  const Scalar* z;
+  const Scalar* wn;
   int64_t xs_h, zs_h;
   int K;
   float eps;
-  Seg seg;
+  Seg<Scalar> seg;
 
   [[sycl::reqd_sub_group_size(kSg)]] void
   operator()(sycl::nd_item<1> item) const {
@@ -510,25 +517,27 @@ struct GatedNormGemvRegKernel {
       float ss = 0.f;
   #pragma unroll
       for (int t = 0; t < kChunkSteps; ++t) {
-        float a = lo_f(d.xd[i][t]), b = hi_f(d.xd[i][t]);
+        float a = lo_f<Scalar>(d.xd[i][t]), b = hi_f<Scalar>(d.xd[i][t]);
         ss = sycl::fma(a, a, ss);
         ss = sycl::fma(b, b, ss);
   #pragma unroll
         for (int o = 0; o < CPH - 1; ++o) {
-          a = lo_f(xo[o][i][t]);
-          b = hi_f(xo[o][i][t]);
+          a = lo_f<Scalar>(xo[o][i][t]);
+          b = hi_f<Scalar>(xo[o][i][t]);
           ss = sycl::fma(a, a, ss);
           ss = sycl::fma(b, b, ss);
         }
-        gf.g[i][t][0] = lo_f(d.wd[0][t]) * silu_fast(lo_f(d.gd[i][t]));
-        gf.g[i][t][1] = hi_f(d.wd[0][t]) * silu_fast(hi_f(d.gd[i][t]));
+        gf.g[i][t][0] =
+            lo_f<Scalar>(d.wd[0][t]) * silu_fast(lo_f<Scalar>(d.gd[i][t]));
+        gf.g[i][t][1] =
+            hi_f<Scalar>(d.wd[0][t]) * silu_fast(hi_f<Scalar>(d.gd[i][t]));
       }
       ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
       d.rstd[i] = sycl::rsqrt(ss * (1.f / float(D)) + eps);
     }
 
-    const GatedRegA<CPS> la{&d, &gf};
-    gemv_body<1, KS, 1, GatedRegA<CPS>, NPRE, CPS>(
+    const GatedRegA<CPS, Scalar> la{&d, &gf};
+    gemv_body<1, KS, 1, GatedRegA<CPS, Scalar>, NPRE, CPS>(
         item, seg, row0, la, part, 1, K, wpre, pre);
 #endif
   }
@@ -583,7 +592,9 @@ static bool heads_ok(
     int64_t D,
     int64_t& s_m,
     int64_t& s_h) {
-  if (!t.is_xpu() || t.scalar_type() != at::kHalf) return false;
+  if (!t.is_xpu() ||
+      (t.scalar_type() != at::kHalf && t.scalar_type() != at::kBFloat16))
+    return false;
   if (t.dim() == 3) {
     if (t.size(0) != M || t.size(1) != H || t.size(2) != D || t.stride(2) != 1)
       return false;
@@ -629,8 +640,9 @@ static bool gated_shapes(
   if (x.dim() == 2 && x.size(1) % D != 0) return false;
   if (M < 1 || M > kMaxM || H < 1) return false;
   return heads_ok(x, M, H, D, xs[0], xs[1]) &&
-         heads_ok(z, M, H, D, zs[0], zs[1]) && z.device() == x.device() &&
-         wn.device() == x.device() && wn.scalar_type() == at::kHalf &&
+         heads_ok(z, M, H, D, zs[0], zs[1]) &&
+         z.scalar_type() == x.scalar_type() && z.device() == x.device() &&
+         wn.device() == x.device() && wn.scalar_type() == x.scalar_type() &&
          wn.stride(0) == 1 && aligned(wn.data_ptr(), 4);
 }
 
@@ -648,7 +660,8 @@ bool gated_rmsnorm_fp8_gemv_supported(
   return is_bmg_cached(x.get_device());
 }
 
-torch::Tensor gated_rmsnorm_fp8_gemv(
+template <typename Scalar>
+torch::Tensor gated_rmsnorm_fp8_gemv_impl(
     const torch::Tensor& x,
     const torch::Tensor& z,
     const torch::Tensor& norm_weight,
@@ -658,10 +671,11 @@ torch::Tensor gated_rmsnorm_fp8_gemv(
   int64_t M, H, D, xs[2], zs[2];
   TORCH_CHECK(
       gated_shapes(x, z, norm_weight, M, H, D, xs, zs),
-      "gated_rmsnorm_fp8_gemv: x, z must be fp16 [M<=8, H, D] (or [M, H*D]) "
+      "gated_rmsnorm_fp8_gemv: x, z must be matching fp16/bf16 [M<=8, H, D] "
+      "(or [M, H*D]) "
       "with contiguous last dim, strides multiple of 8 and 16 B alignment; "
       "norm_weight "
-      "fp16 [D] contiguous with D % 64 == 0 (got x ",
+      "fp16/bf16 [D] contiguous with D % 64 == 0 (got x ",
       x.sizes(),
       " z ",
       z.sizes(),
@@ -674,20 +688,20 @@ torch::Tensor gated_rmsnorm_fp8_gemv(
   const int64_t N = w.size(0);
   auto out = at::empty({M, N}, x.options());
   auto& q = vllm::xpu::vllmGetQueue();
-  Seg seg{
+  Seg<Scalar> seg{
       reinterpret_cast<const uint8_t*>(w.data_ptr()),
       scale.data_ptr<float>(),
-      reinterpret_cast<sycl::half*>(out.data_ptr()),
+      reinterpret_cast<Scalar*>(out.data_ptr()),
       int(N),
       int(N),
       0};
   auto launch = [&](auto mp_tag) {
     constexpr int MP = decltype(mp_tag)::value;
     constexpr int KS = 4, RG = 1;
-    GatedNormA<MP> ga{
-        reinterpret_cast<const sycl::half*>(x.data_ptr()),
-        reinterpret_cast<const sycl::half*>(z.data_ptr()),
-        reinterpret_cast<const sycl::half*>(norm_weight.data_ptr()),
+    GatedNormA<MP, Scalar> ga{
+        reinterpret_cast<const Scalar*>(x.data_ptr()),
+        reinterpret_cast<const Scalar*>(z.data_ptr()),
+        reinterpret_cast<const Scalar*>(norm_weight.data_ptr()),
         xs[0],
         xs[1],
         zs[0],
@@ -699,7 +713,7 @@ torch::Tensor gated_rmsnorm_fp8_gemv(
     syclex::nd_launch(
         q,
         sycl::nd_range<1>(size_t(wgs) * RG * KS * kSg, RG * KS * kSg),
-        GatedNormGemvKernel<MP, KS, RG>{ga, seg, int(K)});
+        GatedNormGemvKernel<MP, KS, RG, Scalar>{ga, seg, int(K)});
   };
   // M = 1, K = 2048 register-resident path. K split: 8 sub-groups per row
   // block while that still fits one wave (<= 2048 sub-groups, e.g. the
@@ -717,10 +731,10 @@ torch::Tensor gated_rmsnorm_fp8_gemv(
       syclex::nd_launch(
           q,
           sycl::nd_range<1>(size_t(row_blocks) * KS * kSg, KS * kSg),
-          GatedNormGemvRegKernel<KS, CPS, CPH>{
-              reinterpret_cast<const sycl::half*>(x.data_ptr()),
-              reinterpret_cast<const sycl::half*>(z.data_ptr()),
-              reinterpret_cast<const sycl::half*>(norm_weight.data_ptr()),
+          GatedNormGemvRegKernel<KS, CPS, CPH, Scalar>{
+              reinterpret_cast<const Scalar*>(x.data_ptr()),
+              reinterpret_cast<const Scalar*>(z.data_ptr()),
+              reinterpret_cast<const Scalar*>(norm_weight.data_ptr()),
               xs[1],
               zs[1],
               int(K),
@@ -751,6 +765,20 @@ torch::Tensor gated_rmsnorm_fp8_gemv(
   return out;
 }
 
+torch::Tensor gated_rmsnorm_fp8_gemv(
+    const torch::Tensor& x,
+    const torch::Tensor& z,
+    const torch::Tensor& norm_weight,
+    double eps,
+    const torch::Tensor& w,
+    const torch::Tensor& scale) {
+  if (x.scalar_type() == at::kHalf)
+    return gated_rmsnorm_fp8_gemv_impl<sycl::half>(
+        x, z, norm_weight, eps, w, scale);
+  return gated_rmsnorm_fp8_gemv_impl<sycl::ext::oneapi::bfloat16>(
+      x, z, norm_weight, eps, w, scale);
+}
+
 // ---- residual add + Gemma RMSNorm ------------------------------------------
 static bool resadd_shapes(
     const torch::Tensor& x,
@@ -763,8 +791,9 @@ static bool resadd_shapes(
   M = x.size(0);
   K = x.size(1);
   return M >= 1 && M <= kMaxM && K % kChunkK == 0 &&
-         x.scalar_type() == at::kHalf && r.scalar_type() == at::kHalf &&
-         wn.scalar_type() == at::kHalf && r.sizes() == x.sizes() &&
+         (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) &&
+         r.scalar_type() == x.scalar_type() &&
+         wn.scalar_type() == x.scalar_type() && r.sizes() == x.sizes() &&
          wn.size(0) == K && x.stride(1) == 1 && r.stride(1) == 1 &&
          wn.stride(0) == 1 && x.stride(0) % 8 == 0 && r.stride(0) % 8 == 0 &&
          aligned(x.data_ptr(), 16) && aligned(r.data_ptr(), 16) &&
@@ -785,7 +814,7 @@ bool resadd_rmsnorm_fp8_gemv_supported(
   return is_bmg_cached(x.get_device());
 }
 
-template <int NSEG>
+template <int NSEG, typename Scalar>
 static void launch_resadd(
     sycl::queue& q,
     const torch::Tensor& x,
@@ -795,8 +824,8 @@ static void launch_resadd(
     double eps,
     int64_t M,
     int64_t K,
-    Seg s0,
-    Seg s1) {
+    Seg<Scalar> s0,
+    Seg<Scalar> s1) {
   constexpr int KS = 4, RG = 1;
   static_assert(RG == 1, "register path assumes one row block per group");
   if (NSEG == 2 && s1.N < s0.N) std::swap(s0, s1);  // small weight first
@@ -810,11 +839,11 @@ static void launch_resadd(
     syclex::nd_launch(
         q,
         sycl::nd_range<1>(size_t(total) * RG * KS * kSg, RG * KS * kSg),
-        ResAddNormGemvKernel<MP, KS, RG, NSEG>{
-            reinterpret_cast<const sycl::half*>(x.data_ptr()),
-            reinterpret_cast<const sycl::half*>(r.data_ptr()),
-            reinterpret_cast<const sycl::half*>(wn.data_ptr()),
-            reinterpret_cast<sycl::half*>(r_out.data_ptr()),
+        ResAddNormGemvKernel<MP, KS, RG, NSEG, Scalar>{
+            reinterpret_cast<const Scalar*>(x.data_ptr()),
+            reinterpret_cast<const Scalar*>(r.data_ptr()),
+            reinterpret_cast<const Scalar*>(wn.data_ptr()),
+            reinterpret_cast<Scalar*>(r_out.data_ptr()),
             x.stride(0),
             r.stride(0),
             r_out.stride(0),
@@ -830,11 +859,11 @@ static void launch_resadd(
     syclex::nd_launch(
         q,
         sycl::nd_range<1>(size_t(total) * RG * KS * kSg, RG * KS * kSg),
-        ResAddNormGemvRegKernel<KS, NSEG, kCps>{
-            reinterpret_cast<const sycl::half*>(x.data_ptr()),
-            reinterpret_cast<const sycl::half*>(r.data_ptr()),
-            reinterpret_cast<const sycl::half*>(wn.data_ptr()),
-            reinterpret_cast<sycl::half*>(r_out.data_ptr()),
+        ResAddNormGemvRegKernel<KS, NSEG, kCps, Scalar>{
+            reinterpret_cast<const Scalar*>(x.data_ptr()),
+            reinterpret_cast<const Scalar*>(r.data_ptr()),
+            reinterpret_cast<const Scalar*>(wn.data_ptr()),
+            reinterpret_cast<Scalar*>(r_out.data_ptr()),
             int(K),
             float(eps),
             s0,
@@ -859,10 +888,11 @@ static void check_resadd(
     int64_t& K) {
   TORCH_CHECK(
       resadd_shapes(x, r, wn, M, K),
-      "resadd_rmsnorm_fp8_gemv: x, residual must be fp16 [M<=8, K] (same "
+      "resadd_rmsnorm_fp8_gemv: x, residual must be matching fp16/bf16 [M<=8, "
+      "K] (same "
       "shape, contiguous last dim, row stride multiple of 8, 16 B aligned), "
       "norm_weight "
-      "fp16 [K] contiguous, K % 64 == 0 (got x ",
+      "fp16/bf16 [K] contiguous, K % 64 == 0 (got x ",
       x.sizes(),
       " residual ",
       r.sizes(),
@@ -871,7 +901,8 @@ static void check_resadd(
       ")");
 }
 
-std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemv(
+template <typename Scalar>
+std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemv_impl(
     const torch::Tensor& x,
     const torch::Tensor& residual,
     const torch::Tensor& norm_weight,
@@ -886,10 +917,10 @@ std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemv(
   auto out = at::empty({M, N}, x.options());
   auto r_out = at::empty({M, K}, x.options());
   auto& q = vllm::xpu::vllmGetQueue();
-  Seg s0{
+  Seg<Scalar> s0{
       reinterpret_cast<const uint8_t*>(w.data_ptr()),
       scale.data_ptr<float>(),
-      reinterpret_cast<sycl::half*>(out.data_ptr()),
+      reinterpret_cast<Scalar*>(out.data_ptr()),
       int(N),
       int(N),
       0};
@@ -897,8 +928,23 @@ std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemv(
   return {out, r_out};
 }
 
+std::tuple<torch::Tensor, torch::Tensor> resadd_rmsnorm_fp8_gemv(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const torch::Tensor& norm_weight,
+    double eps,
+    const torch::Tensor& w,
+    const torch::Tensor& scale) {
+  if (x.scalar_type() == at::kHalf)
+    return resadd_rmsnorm_fp8_gemv_impl<sycl::half>(
+        x, residual, norm_weight, eps, w, scale);
+  return resadd_rmsnorm_fp8_gemv_impl<sycl::ext::oneapi::bfloat16>(
+      x, residual, norm_weight, eps, w, scale);
+}
+
+template <typename Scalar>
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-resadd_rmsnorm_fp8_gemv2(
+resadd_rmsnorm_fp8_gemv2_impl(
     const torch::Tensor& x,
     const torch::Tensor& residual,
     const torch::Tensor& norm_weight,
@@ -917,22 +963,39 @@ resadd_rmsnorm_fp8_gemv2(
   auto out2 = at::empty({M, N2}, x.options());
   auto r_out = at::empty({M, K}, x.options());
   auto& q = vllm::xpu::vllmGetQueue();
-  Seg s0{
+  Seg<Scalar> s0{
       reinterpret_cast<const uint8_t*>(w1.data_ptr()),
       scale1.data_ptr<float>(),
-      reinterpret_cast<sycl::half*>(out1.data_ptr()),
+      reinterpret_cast<Scalar*>(out1.data_ptr()),
       int(N1),
       int(N1),
       0};
-  Seg s1{
+  Seg<Scalar> s1{
       reinterpret_cast<const uint8_t*>(w2.data_ptr()),
       scale2.data_ptr<float>(),
-      reinterpret_cast<sycl::half*>(out2.data_ptr()),
+      reinterpret_cast<Scalar*>(out2.data_ptr()),
       int(N2),
       int(N2),
       0};
   launch_resadd<2>(q, x, residual, norm_weight, r_out, eps, M, K, s0, s1);
   return {out1, out2, r_out};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+resadd_rmsnorm_fp8_gemv2(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const torch::Tensor& norm_weight,
+    double eps,
+    const torch::Tensor& w1,
+    const torch::Tensor& scale1,
+    const torch::Tensor& w2,
+    const torch::Tensor& scale2) {
+  if (x.scalar_type() == at::kHalf)
+    return resadd_rmsnorm_fp8_gemv2_impl<sycl::half>(
+        x, residual, norm_weight, eps, w1, scale1, w2, scale2);
+  return resadd_rmsnorm_fp8_gemv2_impl<sycl::ext::oneapi::bfloat16>(
+      x, residual, norm_weight, eps, w1, scale1, w2, scale2);
 }
 
 // ---------------------------------------------------------------------------
@@ -943,11 +1006,12 @@ resadd_rmsnorm_fp8_gemv2(
 // ---------------------------------------------------------------------------
 constexpr int kNormWg = 256;
 
+template <typename Scalar>
 struct GatedNormKernel {
-  const sycl::half* x;
-  const sycl::half* z;
-  const sycl::half* wn;
-  sycl::half* y;  // [M, H * D] contiguous
+  const Scalar* x;
+  const Scalar* z;
+  const Scalar* wn;
+  Scalar* y;  // [M, H * D] contiguous
   int64_t xs_m, xs_h, zs_m, zs_h;
   int H, D;
   float eps;
@@ -955,9 +1019,9 @@ struct GatedNormKernel {
   void operator()(sycl::nd_item<1> it) const {
     const int g = it.get_group(0), lid = it.get_local_id(0);
     const int m = g / H, h = g - m * H;
-    const sycl::half* xh = x + m * xs_m + h * xs_h;
-    const sycl::half* zh = z + m * zs_m + h * zs_h;
-    sycl::half* yh = y + int64_t(g) * D;
+    const Scalar* xh = x + m * xs_m + h * xs_h;
+    const Scalar* zh = z + m * zs_m + h * zs_h;
+    Scalar* yh = y + int64_t(g) * D;
     float ss = 0.f;
     for (int d = lid; d < D; d += kNormWg) {
       const float v = float(xh[d]);
@@ -966,36 +1030,36 @@ struct GatedNormKernel {
     ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
     const float rstd = sycl::rsqrt(ss / float(D) + eps);
     for (int d = lid; d < D; d += kNormWg)
-      yh[d] =
-          sycl::half(float(xh[d]) * rstd * float(wn[d]) * silu(float(zh[d])));
+      yh[d] = Scalar(float(xh[d]) * rstd * float(wn[d]) * silu(float(zh[d])));
   }
 };
 
+template <typename Scalar>
 struct ResAddNormKernel {
-  const sycl::half* x;
-  const sycl::half* r;
-  const sycl::half* wn;
-  sycl::half* y;      // [M, K] contiguous
-  sycl::half* r_out;  // [M, K] contiguous
+  const Scalar* x;
+  const Scalar* r;
+  const Scalar* wn;
+  Scalar* y;      // [M, K] contiguous
+  Scalar* r_out;  // [M, K] contiguous
   int64_t xs, rs;
   int K;
   float eps;
 
   void operator()(sycl::nd_item<1> it) const {
     const int m = it.get_group(0), lid = it.get_local_id(0);
-    const sycl::half* xm = x + m * xs;
-    const sycl::half* rm = r + m * rs;
+    const Scalar* xm = x + m * xs;
+    const Scalar* rm = r + m * rs;
     float ss = 0.f;
     for (int k = lid; k < K; k += kNormWg) {
       const float t = float(xm[k]) + float(rm[k]);
-      r_out[int64_t(m) * K + k] = sycl::half(t);
+      r_out[int64_t(m) * K + k] = Scalar(t);
       ss = sycl::fma(t, t, ss);
     }
     ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
     const float rstd = sycl::rsqrt(ss / float(K) + eps);
     for (int k = lid; k < K; k += kNormWg) {
       const float t = float(xm[k]) + float(rm[k]);
-      y[int64_t(m) * K + k] = sycl::half(t * rstd * (float(wn[k]) + 1.f));
+      y[int64_t(m) * K + k] = Scalar(t * rstd * (float(wn[k]) + 1.f));
     }
   }
 };
@@ -1008,7 +1072,9 @@ static bool norm_heads_ok(
     int64_t D,
     int64_t& s_m,
     int64_t& s_h) {
-  if (!t.is_xpu() || t.scalar_type() != at::kHalf || t.device() != ref.device())
+  if (!t.is_xpu() ||
+      (t.scalar_type() != at::kHalf && t.scalar_type() != at::kBFloat16) ||
+      (t.device() != ref.device() || t.scalar_type() != ref.scalar_type()))
     return false;
   if (t.dim() == 3 && t.size(1) == H && t.size(2) == D && t.stride(2) == 1) {
     s_m = t.stride(0);
@@ -1024,14 +1090,15 @@ static bool norm_heads_ok(
 }
 
 // Returns y [M, H*D], or nullopt if the inputs need the generic ATen path.
-static std::optional<torch::Tensor> gated_rmsnorm_kernel(
+template <typename Scalar>
+static std::optional<torch::Tensor> gated_rmsnorm_kernel_impl(
     const torch::Tensor& x,
     const torch::Tensor& z,
     const torch::Tensor& wn,
     double eps) {
-  if (wn.dim() != 1 || wn.scalar_type() != at::kHalf || wn.stride(0) != 1 ||
-      wn.device() != x.device() || (x.dim() != 2 && x.dim() != 3) ||
-      z.sizes() != x.sizes())
+  if (wn.dim() != 1 || wn.scalar_type() != x.scalar_type() ||
+      wn.stride(0) != 1 || wn.device() != x.device() ||
+      (x.dim() != 2 && x.dim() != 3) || z.sizes() != x.sizes())
     return std::nullopt;
   const int64_t D = wn.size(0), M = x.size(0);
   if (D < 1 || (x.dim() == 2 && x.size(1) % D != 0)) return std::nullopt;
@@ -1046,11 +1113,11 @@ static std::optional<torch::Tensor> gated_rmsnorm_kernel(
   syclex::nd_launch(
       vllm::xpu::vllmGetQueue(),
       sycl::nd_range<1>(size_t(M * H) * kNormWg, kNormWg),
-      GatedNormKernel{
-          reinterpret_cast<const sycl::half*>(x.data_ptr()),
-          reinterpret_cast<const sycl::half*>(z.data_ptr()),
-          reinterpret_cast<const sycl::half*>(wn.data_ptr()),
-          reinterpret_cast<sycl::half*>(y.data_ptr()),
+      GatedNormKernel<Scalar>{
+          reinterpret_cast<const Scalar*>(x.data_ptr()),
+          reinterpret_cast<const Scalar*>(z.data_ptr()),
+          reinterpret_cast<const Scalar*>(wn.data_ptr()),
+          reinterpret_cast<Scalar*>(y.data_ptr()),
           xs_m,
           xs_h,
           zs_m,
@@ -1061,16 +1128,28 @@ static std::optional<torch::Tensor> gated_rmsnorm_kernel(
   return y;
 }
 
+static std::optional<torch::Tensor> gated_rmsnorm_kernel(
+    const torch::Tensor& x,
+    const torch::Tensor& z,
+    const torch::Tensor& wn,
+    double eps) {
+  if (x.scalar_type() == at::kHalf)
+    return gated_rmsnorm_kernel_impl<sycl::half>(x, z, wn, eps);
+  return gated_rmsnorm_kernel_impl<sycl::ext::oneapi::bfloat16>(x, z, wn, eps);
+}
+
 // Returns (y, residual_out) [M, K], or nullopt for the generic ATen path.
+template <typename Scalar>
 static std::optional<std::tuple<torch::Tensor, torch::Tensor>>
-resadd_rmsnorm_kernel(
+resadd_rmsnorm_kernel_impl(
     const torch::Tensor& x,
     const torch::Tensor& r,
     const torch::Tensor& wn,
     double eps) {
   if (!x.is_xpu() || x.dim() != 2 || r.sizes() != x.sizes() ||
-      x.scalar_type() != at::kHalf || r.scalar_type() != at::kHalf ||
-      wn.scalar_type() != at::kHalf || wn.dim() != 1 ||
+      (x.scalar_type() != at::kHalf && x.scalar_type() != at::kBFloat16) ||
+      r.scalar_type() != x.scalar_type() ||
+      wn.scalar_type() != x.scalar_type() || wn.dim() != 1 ||
       wn.size(0) != x.size(1) || x.stride(1) != 1 || r.stride(1) != 1 ||
       wn.stride(0) != 1 || r.device() != x.device() ||
       wn.device() != x.device() || x.size(0) >= (int64_t(1) << 31))
@@ -1083,17 +1162,28 @@ resadd_rmsnorm_kernel(
     syclex::nd_launch(
         vllm::xpu::vllmGetQueue(),
         sycl::nd_range<1>(size_t(M) * kNormWg, kNormWg),
-        ResAddNormKernel{
-            reinterpret_cast<const sycl::half*>(x.data_ptr()),
-            reinterpret_cast<const sycl::half*>(r.data_ptr()),
-            reinterpret_cast<const sycl::half*>(wn.data_ptr()),
-            reinterpret_cast<sycl::half*>(y.data_ptr()),
-            reinterpret_cast<sycl::half*>(r_out.data_ptr()),
+        ResAddNormKernel<Scalar>{
+            reinterpret_cast<const Scalar*>(x.data_ptr()),
+            reinterpret_cast<const Scalar*>(r.data_ptr()),
+            reinterpret_cast<const Scalar*>(wn.data_ptr()),
+            reinterpret_cast<Scalar*>(y.data_ptr()),
+            reinterpret_cast<Scalar*>(r_out.data_ptr()),
             x.stride(0),
             r.stride(0),
             int(K),
             float(eps)});
   return std::make_tuple(y, r_out);
+}
+
+static std::optional<std::tuple<torch::Tensor, torch::Tensor>>
+resadd_rmsnorm_kernel(
+    const torch::Tensor& x,
+    const torch::Tensor& r,
+    const torch::Tensor& wn,
+    double eps) {
+  if (x.scalar_type() == at::kHalf)
+    return resadd_rmsnorm_kernel_impl<sycl::half>(x, r, wn, eps);
+  return resadd_rmsnorm_kernel_impl<sycl::ext::oneapi::bfloat16>(x, r, wn, eps);
 }
 
 // ---------------------------------------------------------------------------

@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Fused routed + shared-expert MoE forward for small-M decode (Qwen3.5/3.6-A3B
- * per-tensor FP8 recipe: fp16 activations, fp8-e4m3 per-expert weights with
- * fp32 scalar scales, SiLU, one sigmoid-gated shared expert).
+ * per-tensor FP8 recipe: FP16/BF16 activations, fp8-e4m3 per-expert weights
+ *with fp32 scalar scales, SiLU, one sigmoid-gated shared expert).
  *
  * One op submits six kernels with no per-call allocation:
  *   1. map     : topk_ids -> compact per-expert tile map, route->row
@@ -22,7 +22,7 @@
  *   w13        [E, H, 2I] fp8, w13_scale [E] fp32   (gate cols [0,I), up
  *[I,2I)) w2         [E, I, H]  fp8, w2_scale  [E] fp32 shared_w13 [H, 2I] fp8,
  *shared_w13_scale [1] fp32 shared_w2  [I, H]     fp8, shared_w2_scale  [1] fp32
- *   shared_gate[H] (or [1, H]) fp16
+ *   shared_gate[H] (or [1, H]) matches the activation dtype
  * ws is a caller-owned uint8 workspace sized by the Python helper
  * (moe_shared_fused_workspace_bytes); the op checks it is large enough.
  * tile_m selects the GEMM M-tile (kMoeSharedFusedTileM8 or
@@ -50,10 +50,7 @@ using namespace cute;
 namespace syclex = sycl::ext::oneapi::experimental;
 namespace intelex = sycl::ext::intel::experimental;
 
-using ElementA = cutlass::half_t;
-using ElementD = cutlass::half_t;
 using ElementS = float;
-using ElementBI = cutlass::half_t;
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
@@ -70,10 +67,13 @@ inline bool num_experts_static_ok(int64_t e) { return e <= MAX_E; }
 // ---------------------------------------------------------------------------
 template <typename IDT>
 class SpMapName;
+template <typename ElementA>
 class SpGatherName;
+template <typename ElementA>
 class SpSiluMulName;
+template <typename ElementA>
 class SpFinalizeName;
-template <class Policy, bool SingleGroup>
+template <class Policy, bool SingleGroup, typename ElementA>
 class SpGemmName;
 
 // ---------------------------------------------------------------------------
@@ -225,6 +225,7 @@ void launch_map_build(
 // ---------------------------------------------------------------------------
 // Kernel 2: gather. x[token(r)] -> A_perm[perm_pos[r]], chunked over K.
 // ---------------------------------------------------------------------------
+template <typename ElementA>
 class SpGatherLauncher {
  public:
   static void launch(
@@ -238,7 +239,7 @@ class SpGatherLauncher {
     // One element per work-item, 2D grid (route, K-chunk of 4) so the
     // work-item indices need no integer division; R*K fully-coalesced.
     q.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for<SpGatherName>(
+      cgh.parallel_for<SpGatherName<ElementA>>(
           sycl::nd_range<2>(sycl::range<2>(R, K / 4), sycl::range<2>(1, 64)),
           [=](sycl::nd_item<2> item) {
             const int r = item.get_global_id(0);
@@ -267,7 +268,7 @@ class SpGatherLauncher {
 // (single group) in ONE grid, ONE submit per gemm stage. The two segments
 // share the same N/K/policy but differ in A/B/D/scale pointers.
 // ---------------------------------------------------------------------------
-template <class Policy, typename ElementB>
+template <class Policy, typename ElementB, typename ElementA>
 void launch_sp_gemm_merged(
     sycl::queue& q,
     const void* A_routed,
@@ -304,7 +305,7 @@ void launch_sp_gemm_merged(
   const int total_wgs = umt * n_tiles + shared_m_tiles * n_tiles;
 
   q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<SpGemmName<Policy, false>>(
+    cgh.parallel_for<SpGemmName<Policy, false, ElementA>>(
         sycl::nd_range<3>(
             sycl::range<3>(1, total_wgs, GEMM_WG),
             sycl::range<3>(1, 1, GEMM_WG)),
@@ -345,18 +346,12 @@ void launch_sp_gemm_merged(
               (ElementA*)A + (int64_t)row0 * K, rows, K);
           auto B_t = MoE::make_moe_tensor<ElementB, 'C'>(
               (ElementB*)B + (int64_t)e * N * K, N, K);
-          auto D_t = MoE::make_moe_tensor<ElementD, 'R'>(
-              (ElementD*)D + (int64_t)row0 * N, rows, N);
+          auto D_t = MoE::make_moe_tensor<ElementA, 'R'>(
+              (ElementA*)D + (int64_t)row0 * N, rows, N);
           auto tile_coord = make_coord(0, n_tile, _, 0);
 
           MoE::xe_gemm<void, void, void>(
-              A_t,
-              B_t,
-              sc + e,
-              (const ElementBI*)nullptr,
-              D_t,
-              tile_coord,
-              mma);
+              A_t, B_t, sc + e, (const ElementA*)nullptr, D_t, tile_coord, mma);
         });
   });
 }
@@ -366,6 +361,7 @@ void launch_sp_gemm_merged(
 // rows first, shared-expert rows after) -- one launch for both activations.
 //   in  [rows, 2*ic] -> out [rows, ic] : silu(in[:, :ic]) * in[:, ic:]
 // ---------------------------------------------------------------------------
+template <typename ElementA>
 class SpSiluMulLauncher {
  public:
   // Silu-and-mul over a COMBINED buffer of [R + M] rows, plus (when the
@@ -394,7 +390,7 @@ class SpSiluMulLauncher {
     const int wgs = silu_wgs + (has_shared ? num_tokens : 0);
     q.submit([&](sycl::handler& cgh) {
       sycl::local_accessor<float, 1> red(sycl::range<1>(64), cgh);
-      cgh.parallel_for<SpSiluMulName>(
+      cgh.parallel_for<SpSiluMulName<ElementA>>(
           sycl::nd_range<1>(sycl::range<1>(wgs * 64), sycl::range<1>(64)),
           [=](sycl::nd_item<1> item) {
             const int g = item.get_group_linear_id();
@@ -450,6 +446,7 @@ class SpSiluMulLauncher {
 // Kernel 8: finalize. out[m, c:c+8] = sum_k w_perm[perm_pos[m,k]] *
 // D2[perm_pos[m,k], c:c+8] + sigmoid(dot(x[m], gate_vec)) * sh2[m, c:c+8]
 // ---------------------------------------------------------------------------
+template <typename ElementA>
 class SpFinalizeLauncher {
  public:
   static void launch(
@@ -459,7 +456,7 @@ class SpFinalizeLauncher {
       const float* w_perm,
       const ElementA* d2,
       const ElementA* sh2,
-      ElementD* out,
+      ElementA* out,
       int num_tokens,
       int H,
       int top_k,
@@ -468,7 +465,7 @@ class SpFinalizeLauncher {
     const int cols = H / VEC;
     const int total = num_tokens * cols;
     q.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for<SpFinalizeName>(
+      cgh.parallel_for<SpFinalizeName<ElementA>>(
           sycl::nd_range<1>(
               sycl::range<1>(((total + 63) / 64) * 64), sycl::range<1>(64)),
           [=](sycl::nd_item<1> item) {
@@ -480,7 +477,7 @@ class SpFinalizeLauncher {
             // Gate was precomputed by the map kernel (vectorized dot there);
             // this kernel is a pure weighted sum + gated shared add.
 
-            ElementD* o = out + (int64_t)m * H + c;
+            ElementA* o = out + (int64_t)m * H + c;
             if (has_shared) {
 #pragma unroll
               for (int j = 0; j < VEC; ++j) {
@@ -489,7 +486,7 @@ class SpFinalizeLauncher {
                   const int p = perm_pos[m * top_k + kk];
                   acc += w_perm[p] * (float)d2[(int64_t)p * H + c + j];
                 }
-                o[j] = ElementD(
+                o[j] = ElementA(
                     acc + gate[m] * (float)sh2[(int64_t)m * H + c + j]);
               }
             } else {
@@ -500,7 +497,7 @@ class SpFinalizeLauncher {
                   const int p = perm_pos[m * top_k + kk];
                   acc += w_perm[p] * (float)d2[(int64_t)p * H + c + j];
                 }
-                o[j] = ElementD(acc);
+                o[j] = ElementA(acc);
               }
             }
           });
@@ -518,7 +515,8 @@ inline int64_t align256(int64_t b) { return (b + 255) / 256 * 256; }
 
 }  // namespace moe_shared_fused
 
-void moe_shared_fused_decode_xe2(
+template <typename ElementA>
+void moe_shared_fused_decode_xe2_impl(
     torch::Tensor& output,
     const torch::Tensor& x,
     const torch::Tensor& topk_ids,
@@ -536,12 +534,13 @@ void moe_shared_fused_decode_xe2(
     int64_t tile_m) {
   using namespace moe_shared_fused;
   constexpr const char* kRecipe =
-      "moe_shared_fused_decode only supports fp16 activations + fp8-e4m3 "
+      "moe_shared_fused_decode only supports fp16/bf16 activations + fp8-e4m3 "
       "per-tensor weights: ";
   TORCH_CHECK(
-      x.scalar_type() == at::kHalf && output.scalar_type() == at::kHalf,
+      (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) &&
+          output.scalar_type() == x.scalar_type(),
       kRecipe,
-      "x and output must be float16");
+      "x and output must have the same float16 or bfloat16 dtype");
   TORCH_CHECK(
       w13.scalar_type() == at::kFloat8_e4m3fn &&
           w2.scalar_type() == at::kFloat8_e4m3fn &&
@@ -563,9 +562,9 @@ void moe_shared_fused_decode_xe2(
       kRecipe,
       "shared scales must be float32 scalars");
   TORCH_CHECK(
-      shared_gate_t.scalar_type() == at::kHalf,
+      shared_gate_t.scalar_type() == x.scalar_type(),
       kRecipe,
-      "shared_gate must be float16");
+      "shared_gate must have the input dtype");
   TORCH_CHECK(
       topk_weights.scalar_type() == at::kFloat, "topk_weights must be float32");
   TORCH_CHECK(
@@ -622,7 +621,7 @@ void moe_shared_fused_decode_xe2(
           (shared_w13->is_contiguous() && shared_w2->is_contiguous() &&
            shared_w13_scale->scalar_type() == at::kFloat &&
            shared_w2_scale->scalar_type() == at::kFloat &&
-           shared_gate->scalar_type() == at::kHalf),
+           shared_gate->scalar_type() == x.scalar_type()),
       "shared expert weight/scale dtypes");
 
   const int umt = R < E ? R : E;
@@ -692,12 +691,15 @@ void moe_shared_fused_decode_xe2(
         perm_pos,
         w_perm);
   }
-  SpGatherLauncher::launch(
+  SpGatherLauncher<ElementA>::launch(
       q, (ElementA*)x.data_ptr(), perm_pos, R, K1, top_k, a_perm);
 
   // 3: gemm1 (routed tiles + shared panel in one grid)
   if (tile_m == kMoeSharedFusedTileM8) {
-    launch_sp_gemm_merged<MoE::w8a16_policy_m_8, cutlass::float_e4m3_t>(
+    launch_sp_gemm_merged<
+        MoE::w8a16_policy_m_8,
+        cutlass::float_e4m3_t,
+        ElementA>(
         q,
         a_perm,
         w13.data_ptr(),
@@ -717,7 +719,10 @@ void moe_shared_fused_decode_xe2(
         K1,
         has_shared);
   } else {
-    launch_sp_gemm_merged<MoE::w8a16_policy_m_16, cutlass::float_e4m3_t>(
+    launch_sp_gemm_merged<
+        MoE::w8a16_policy_m_16,
+        cutlass::float_e4m3_t,
+        ElementA>(
         q,
         a_perm,
         w13.data_ptr(),
@@ -739,7 +744,7 @@ void moe_shared_fused_decode_xe2(
   }
 
   // 4: combined activation (routed rows + shared rows)
-  SpSiluMulLauncher::launch(
+  SpSiluMulLauncher<ElementA>::launch(
       q,
       d1,
       act,
@@ -754,7 +759,10 @@ void moe_shared_fused_decode_xe2(
 
   // 5: gemm2 (routed tiles + shared panel in one grid)
   if (tile_m == kMoeSharedFusedTileM8) {
-    launch_sp_gemm_merged<MoE::w8a16_policy_m_8, cutlass::float_e4m3_t>(
+    launch_sp_gemm_merged<
+        MoE::w8a16_policy_m_8,
+        cutlass::float_e4m3_t,
+        ElementA>(
         q,
         act,
         w2.data_ptr(),
@@ -774,7 +782,10 @@ void moe_shared_fused_decode_xe2(
         K2,
         has_shared);
   } else {
-    launch_sp_gemm_merged<MoE::w8a16_policy_m_16, cutlass::float_e4m3_t>(
+    launch_sp_gemm_merged<
+        MoE::w8a16_policy_m_16,
+        cutlass::float_e4m3_t,
+        ElementA>(
         q,
         act,
         w2.data_ptr(),
@@ -796,16 +807,67 @@ void moe_shared_fused_decode_xe2(
   }
 
   // 6: finalize (pure weighted sum + gated shared add) into output
-  SpFinalizeLauncher::launch(
+  SpFinalizeLauncher<ElementA>::launch(
       q,
       gate_out,
       perm_pos,
       w_perm,
       d2,
       sh2,
-      (ElementD*)output.data_ptr(),
+      (ElementA*)output.data_ptr(),
       num_tokens,
       H,
       top_k,
       has_shared);
+}
+
+void moe_shared_fused_decode_xe2(
+    torch::Tensor& output,
+    const torch::Tensor& x,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& w13,
+    const torch::Tensor& w13_scale,
+    const torch::Tensor& w2,
+    const torch::Tensor& w2_scale,
+    const torch::Tensor& shared_w13_t,
+    const torch::Tensor& shared_w13_scale_t,
+    const torch::Tensor& shared_w2_t,
+    const torch::Tensor& shared_w2_scale_t,
+    const torch::Tensor& shared_gate_t,
+    torch::Tensor& ws,
+    int64_t tile_m) {
+  if (x.scalar_type() == at::kBFloat16)
+    return moe_shared_fused_decode_xe2_impl<cutlass::bfloat16_t>(
+        output,
+        x,
+        topk_ids,
+        topk_weights,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        shared_w13_t,
+        shared_w13_scale_t,
+        shared_w2_t,
+        shared_w2_scale_t,
+        shared_gate_t,
+        ws,
+        tile_m);
+  return moe_shared_fused_decode_xe2_impl<cutlass::half_t>(
+      output,
+      x,
+      topk_ids,
+      topk_weights,
+      w13,
+      w13_scale,
+      w2,
+      w2_scale,
+      shared_w13_t,
+      shared_w13_scale_t,
+      shared_w2_t,
+      shared_w2_scale_t,
+      shared_gate_t,
+      ws,
+      tile_m);
 }

@@ -28,14 +28,14 @@ namespace syclex = sycl::ext::oneapi::experimental;
 
 // ------------------------------------------------------------ kernel -----
 // Work-group = RG row blocks (16 rows each) x KS K-split sub-groups.
-template <int MP, int KS, int RG, int NSEG>
+template <int MP, int KS, int RG, int NSEG, typename Scalar>
 struct Fp8GemvKernel {
-  const sycl::half* a;
+  const Scalar* a;
   int a_pitch_bytes;
   int M;
   int K;
-  Seg seg0;
-  Seg seg1;
+  Seg<Scalar> seg0;
+  Seg<Scalar> seg1;
 
   [[sycl::reqd_sub_group_size(kSg)]] void
   operator()(sycl::nd_item<1> item) const {
@@ -44,10 +44,10 @@ struct Fp8GemvKernel {
         float[RG * KS * MP * kSg]>(item.get_group());
     const int g = int(item.get_group(0));
     const bool second = NSEG == 2 && g >= seg1.wg_begin;
-    const Seg& seg = second ? seg1 : seg0;
+    const Seg<Scalar>& seg = second ? seg1 : seg0;
     const u32x8 none[1][kChunkSteps] = {};
     const int wg_row0 = (g - seg.wg_begin) * RG * kRowBlock;
-    const GlobalA<MP> ga{a, K, M, a_pitch_bytes};
+    const GlobalA<MP, Scalar> ga{a, K, M, a_pitch_bytes};
     if constexpr (NSEG == 2 && RG >= 2) {
       // A segment that fits in half a work-group (e.g. the 32-row GDN
       // in_proj_ba next to in_proj_qkvz) re-maps the sub-groups to twice the
@@ -64,32 +64,32 @@ struct Fp8GemvKernel {
   }
 };
 
-template <int MP, int KS, int RG, int NSEG>
+template <int MP, int KS, int RG, int NSEG, typename Scalar>
 static void launch_gemv(
     sycl::queue& q,
-    const sycl::half* a,
+    const Scalar* a,
     int a_pitch_bytes,
     int M,
     int K,
-    const Seg& s0,
-    const Seg& s1,
+    const Seg<Scalar>& s0,
+    const Seg<Scalar>& s1,
     int total_wgs) {
   // enqueue-functions launch: ~4 us less host time than queue::parallel_for
   syclex::nd_launch(
       q,
       sycl::nd_range<1>(size_t(total_wgs) * RG * KS * kSg, RG * KS * kSg),
-      Fp8GemvKernel<MP, KS, RG, NSEG>{a, a_pitch_bytes, M, K, s0, s1});
+      Fp8GemvKernel<MP, KS, RG, NSEG, Scalar>{a, a_pitch_bytes, M, K, s0, s1});
 }
 
-template <int KS, int RG, int NSEG>
+template <int KS, int RG, int NSEG, typename Scalar>
 static void launch_mp(
     sycl::queue& q,
-    const sycl::half* a,
+    const Scalar* a,
     int a_pitch_bytes,
     int M,
     int K,
-    const Seg& s0,
-    const Seg& s1,
+    const Seg<Scalar>& s0,
+    const Seg<Scalar>& s1,
     int total_wgs) {
   if (M == 1)
     launch_gemv<1, KS, RG, NSEG>(q, a, a_pitch_bytes, M, K, s0, s1, total_wgs);
@@ -107,15 +107,15 @@ static void launch_mp(
 //  * M >= 5 and N >= 4096: KS = 2, RG = 4 -- fewer, longer sub-groups and
 //    a packed (128 B / store) epilogue; ~2% faster than the default there;
 //  * otherwise KS = 4, RG = 1 (4 sub-groups per 16 rows).
-template <int KS, int RG, int NSEG>
+template <int KS, int RG, int NSEG, typename Scalar>
 static void run_cfg(
     sycl::queue& q,
-    const sycl::half* a,
+    const Scalar* a,
     int a_pitch_bytes,
     int M,
     int K,
-    Seg s0,
-    Seg s1) {
+    Seg<Scalar> s0,
+    Seg<Scalar> s1) {
   constexpr int rows = RG * kRowBlock;
   const int w0 = (s0.N + rows - 1) / rows;
   s0.wg_begin = 0;
@@ -124,15 +124,15 @@ static void run_cfg(
   launch_mp<KS, RG, NSEG>(q, a, a_pitch_bytes, M, K, s0, s1, total);
 }
 
-template <int NSEG>
+template <int NSEG, typename Scalar>
 static void run_gemv(
     sycl::queue& q,
-    const sycl::half* a,
+    const Scalar* a,
     int a_pitch_bytes,
     int M,
     int K,
-    Seg s0,
-    Seg s1) {
+    Seg<Scalar> s0,
+    Seg<Scalar> s1) {
   // Two weights: schedule the smaller one first so its work-groups do not
   // form a tail behind the large one.
   if (NSEG == 2 && s1.N < s0.N) std::swap(s0, s1);
@@ -153,7 +153,10 @@ static inline bool aligned64(const void* p) {
 // Activation [.., K] fp16 viewable as [M, K] with a 2D-block-IO legal pitch.
 static bool
 act_ok(const torch::Tensor& x, int64_t& M, int64_t& K, int64_t& pitch) {
-  if (!x.is_xpu() || x.scalar_type() != at::kHalf || x.dim() < 2) return false;
+  if (!x.is_xpu() ||
+      !(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) ||
+      x.dim() < 2)
+    return false;
   K = x.size(-1);
   if (K <= 0 || x.stride(-1) != 1) return false;
   M = x.numel() / K;
@@ -218,7 +221,9 @@ bool fp8_gemv_w8a16_supported_nt(
 static void
 check_common(const torch::Tensor& x, int64_t& M, int64_t& K, int64_t& pitch) {
   TORCH_CHECK(x.is_xpu(), "fp8_gemv: x must be an XPU tensor");
-  TORCH_CHECK(x.scalar_type() == at::kHalf, "fp8_gemv: x must be float16");
+  TORCH_CHECK(
+      (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16),
+      "fp8_gemv: x must be float16 or bfloat16");
   TORCH_CHECK(x.dim() >= 2, "fp8_gemv: x must be at least 2-D");
   TORCH_CHECK(x.stride(-1) == 1, "fp8_gemv: x last dim must be contiguous");
   TORCH_CHECK(
@@ -277,7 +282,8 @@ static std::vector<int64_t> out_shape(const torch::Tensor& x, int64_t N) {
 }
 
 // ------------------------------------------------------ host entries -----
-torch::Tensor fp8_gemv_w8a16(
+template <typename Scalar>
+torch::Tensor fp8_gemv_w8a16_impl(
     const torch::Tensor& x,
     const torch::Tensor& w,
     const torch::Tensor& scale) {
@@ -288,16 +294,16 @@ torch::Tensor fp8_gemv_w8a16(
   const int64_t N = w.size(0);
   auto out = at::empty(out_shape(x, N), x.options());
   auto& q = vllm::xpu::vllmGetQueue();
-  Seg s0{
+  Seg<Scalar> s0{
       reinterpret_cast<const uint8_t*>(w.data_ptr()),
       scale.data_ptr<float>(),
-      reinterpret_cast<sycl::half*>(out.data_ptr()),
+      reinterpret_cast<Scalar*>(out.data_ptr()),
       int(N),
       int(N),
       0};
   run_gemv<1>(
       q,
-      reinterpret_cast<const sycl::half*>(x.data_ptr()),
+      reinterpret_cast<const Scalar*>(x.data_ptr()),
       int(pitch * 2),
       int(M),
       int(K),
@@ -306,7 +312,17 @@ torch::Tensor fp8_gemv_w8a16(
   return out;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> fp8_gemv2_w8a16(
+torch::Tensor fp8_gemv_w8a16(
+    const torch::Tensor& x,
+    const torch::Tensor& w,
+    const torch::Tensor& scale) {
+  if (x.scalar_type() == at::kHalf)
+    return fp8_gemv_w8a16_impl<sycl::half>(x, w, scale);
+  return fp8_gemv_w8a16_impl<sycl::ext::oneapi::bfloat16>(x, w, scale);
+}
+
+template <typename Scalar>
+std::tuple<torch::Tensor, torch::Tensor> fp8_gemv2_w8a16_impl(
     const torch::Tensor& x,
     const torch::Tensor& w1,
     const torch::Tensor& scale1,
@@ -321,29 +337,41 @@ std::tuple<torch::Tensor, torch::Tensor> fp8_gemv2_w8a16(
   auto out1 = at::empty(out_shape(x, N1), x.options());
   auto out2 = at::empty(out_shape(x, N2), x.options());
   auto& q = vllm::xpu::vllmGetQueue();
-  Seg s0{
+  Seg<Scalar> s0{
       reinterpret_cast<const uint8_t*>(w1.data_ptr()),
       scale1.data_ptr<float>(),
-      reinterpret_cast<sycl::half*>(out1.data_ptr()),
+      reinterpret_cast<Scalar*>(out1.data_ptr()),
       int(N1),
       int(N1),
       0};
-  Seg s1{
+  Seg<Scalar> s1{
       reinterpret_cast<const uint8_t*>(w2.data_ptr()),
       scale2.data_ptr<float>(),
-      reinterpret_cast<sycl::half*>(out2.data_ptr()),
+      reinterpret_cast<Scalar*>(out2.data_ptr()),
       int(N2),
       int(N2),
       0};
   run_gemv<2>(
       q,
-      reinterpret_cast<const sycl::half*>(x.data_ptr()),
+      reinterpret_cast<const Scalar*>(x.data_ptr()),
       int(pitch * 2),
       int(M),
       int(K),
       s0,
       s1);
   return {out1, out2};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fp8_gemv2_w8a16(
+    const torch::Tensor& x,
+    const torch::Tensor& w1,
+    const torch::Tensor& scale1,
+    const torch::Tensor& w2,
+    const torch::Tensor& scale2) {
+  if (x.scalar_type() == at::kHalf)
+    return fp8_gemv2_w8a16_impl<sycl::half>(x, w1, scale1, w2, scale2);
+  return fp8_gemv2_w8a16_impl<sycl::ext::oneapi::bfloat16>(
+      x, w1, scale1, w2, scale2);
 }
 
 // Bridge entry for the existing fp8_gemm_w8a16(A, B=[K,N] NT view, ...) op

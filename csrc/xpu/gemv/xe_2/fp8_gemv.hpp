@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Small-M (M = 1..8) FP8-E4M3 x FP16 GEMV for Xe2 (BMG), fp32 accumulation:
+// Small-M (M = 1..8) FP8-E4M3 x FP16/BF16 GEMV for Xe2 (BMG), fp32
+// accumulation:
 //
-//     out[m, n] = fp16( scale * sum_k a[m, k] * w[n, k] )
+//     out[m, n] = input_dtype( scale * sum_k a[m, k] * w[n, k] )
 //
-// w is row-major [N, K] FP8-E4M3 with ONE fp32 per-tensor scale, a is FP16.
-// The same core serves fused variants whose activation operand `a` is
+// w is row-major [N, K] FP8-E4M3 with ONE fp32 per-tensor scale, a is FP16 or
+// BF16. The same core serves fused variants whose activation operand `a` is
 // produced by an in-kernel prologue (RMSNorm / gated RMSNorm) into SLM.
 //
 // Design (plain SYCL + the SYCL-TLA/CuTe Xe DPAS and 2D-block-IO atoms):
@@ -16,20 +17,21 @@
 //   * W is read with 2D block TRANSPOSED loads (16 rows x 8 dwords per
 //     message): lane j receives 32 contiguous bytes of row n0 + j, which is
 //     exactly the DPAS B-operand (VNNI) register layout once the FP8 bytes
-//     are widened to FP16 pairs -- one load message per 512 B, no gathers;
-//   * FP8 -> FP16 is exact bit arithmetic on 32-bit words (an E4M3 byte
-//     placed in the FP16 exponent/mantissa slots equals value * 2^-8, also
-//     for subnormals); the 2^8 is folded into the final scale;
+//     are widened to FP16/BF16 pairs -- one message per 512 B, no gathers;
+//   * FP8 -> FP16/BF16 uses exact bit arithmetic at value * 2^-8, including
+//     subnormals; the 2^8 is folded into the final scale;
 //   * the byte pairing produced by that decode ({0,2} and {1,3} of each
 //     word) is matched by splitting every 32-K step into an "even k" and an
 //     "odd k" DPAS: the A operand (activations, M rows padded to MP in
-//     {1,2,4,8} = DPAS repeat count) takes the low / high fp16 of each
-//     activation dword, so no shuffles are needed on either operand;
-//   * DPAS (XE_{MP}x16x16_F32F16F16F32_TT) does the math, so the cost per
+//     {1,2,4,8} = DPAS repeat count) takes each low / high 16-bit element;
+//     no shuffles are needed on either operand;
+//   * FP16/BF16 DPAS with FP32 accumulation does the math, so the cost per
 //     weight byte is almost independent of M.
 #pragma once
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <type_traits>
 
 #include <cute/tensor.hpp>
 #include <cute/arch/copy_xe_legacy.hpp>
@@ -50,38 +52,50 @@ constexpr float kE4M3DecodeScale = 256.f;  // undo the 2^-8 of the bit decode
 using u32x8 = sycl::vec<uint32_t, 8>;
 
 // ---------------------------------------------------------------- DPAS -----
-template <int MP>
+template <int MP, typename Scalar = sycl::half>
 struct Dpas;
-template <>
-struct Dpas<8> {
+template <typename Scalar>
+struct Dpas<8, Scalar> {
   using A = cute::intel::short8;
   using C = cute::intel::float8;
   static inline void mma(C& c, const A& a, const cute::intel::int8& b) {
-    cute::XE_8x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    if constexpr (std::is_same_v<Scalar, sycl::half>)
+      cute::XE_8x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    else
+      cute::XE_8x16x16_F32BF16BF16F32_TT::fma(c, a, b, c);
   }
 };
-template <>
-struct Dpas<4> {
+template <typename Scalar>
+struct Dpas<4, Scalar> {
   using A = cute::intel::short4;
   using C = cute::intel::float4;
   static inline void mma(C& c, const A& a, const cute::intel::int8& b) {
-    cute::XE_4x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    if constexpr (std::is_same_v<Scalar, sycl::half>)
+      cute::XE_4x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    else
+      cute::XE_4x16x16_F32BF16BF16F32_TT::fma(c, a, b, c);
   }
 };
-template <>
-struct Dpas<2> {
+template <typename Scalar>
+struct Dpas<2, Scalar> {
   using A = cute::intel::short2;
   using C = cute::intel::float2;
   static inline void mma(C& c, const A& a, const cute::intel::int8& b) {
-    cute::XE_2x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    if constexpr (std::is_same_v<Scalar, sycl::half>)
+      cute::XE_2x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    else
+      cute::XE_2x16x16_F32BF16BF16F32_TT::fma(c, a, b, c);
   }
 };
-template <>
-struct Dpas<1> {
+template <typename Scalar>
+struct Dpas<1, Scalar> {
   using A = short;
   using C = float;
   static inline void mma(C& c, const A& a, const cute::intel::int8& b) {
-    cute::XE_1x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    if constexpr (std::is_same_v<Scalar, sycl::half>)
+      cute::XE_1x16x16_F32F16F16F32_TT::fma(c, a, b, c);
+    else
+      cute::XE_1x16x16_F32BF16BF16F32_TT::fma(c, a, b, c);
   }
 };
 
@@ -100,13 +114,38 @@ static inline float vget(const V& v, int i) {
     return v[i];
 }
 
-// 4 packed E4M3 bytes -> fp16 pairs (value * 2^-8): even = bytes {0, 2},
-// odd = bytes {1, 3}; low 16 bits hold the lower byte of each pair.
-static inline uint32_t e4m3_even(uint32_t v) {
-  return ((v & 0x00800080u) << 8) | ((v & 0x007F007Fu) << 7);
+// Decode an E4M3 byte into BF16 bits at the same 2^-8 scale as FP16.
+// Subnormals must be normalized explicitly: BF16 has a different bias.
+static inline uint16_t e4m3_bf16(uint32_t byte) {
+  const uint16_t sign = uint16_t((byte & 0x80u) << 8);
+  const uint32_t magnitude = byte & 0x7fu;
+  const uint32_t exponent = magnitude >> 3;
+  const uint32_t mantissa = magnitude & 7u;
+  if (magnitude == 0x7fu) return sign | 0x7fc0u;
+  if (exponent != 0)
+    return sign | uint16_t((exponent + 112u) << 7) | uint16_t(mantissa << 4);
+  if (mantissa == 0) return sign;
+  const uint32_t leading = mantissa >= 4 ? 2 : (mantissa >= 2 ? 1 : 0);
+  return sign | uint16_t((110u + leading) << 7) |
+         uint16_t((mantissa - (1u << leading)) << (7u - leading));
 }
+
+// Four E4M3 bytes -> 16-bit pairs: even = {0, 2}, odd = {1, 3}.
+template <typename Scalar = sycl::half>
+static inline uint32_t e4m3_even(uint32_t v) {
+  if constexpr (std::is_same_v<Scalar, sycl::half>)
+    return ((v & 0x00800080u) << 8) | ((v & 0x007F007Fu) << 7);
+  else
+    return uint32_t(e4m3_bf16(v & 0xffu)) |
+           (uint32_t(e4m3_bf16((v >> 16) & 0xffu)) << 16);
+}
+template <typename Scalar = sycl::half>
 static inline uint32_t e4m3_odd(uint32_t v) {
-  return (v & 0x80008000u) | ((v & 0x7F007F00u) >> 1);
+  if constexpr (std::is_same_v<Scalar, sycl::half>)
+    return (v & 0x80008000u) | ((v & 0x7F007F00u) >> 1);
+  else
+    return uint32_t(e4m3_bf16((v >> 8) & 0xffu)) |
+           (uint32_t(e4m3_bf16(v >> 24)) << 16);
 }
 
 // DPAS A operands of one chunk (even / odd k of each 32-K step).
@@ -152,9 +191,9 @@ static inline void load_w_chunk(
 
 // Activation chunk from global: per step one 2D load of MP rows x 16
 // dwords; lane j of row m = a[m, kc + 32 t + 2 j .. + 1]. Rows >= M read 0.
-template <int MP>
+template <int MP, typename Scalar>
 static inline void load_a_global(
-    const sycl::half* a, int K, int M, int pitch_bytes, int kc, AOps<MP>& A) {
+    const Scalar* a, int K, int M, int pitch_bytes, int kc, AOps<MP>& A) {
 #ifdef __SYCL_DEVICE_ONLY__
   uint32_t ab[kChunkSteps][MP];
   #pragma unroll
@@ -202,9 +241,9 @@ static inline void load_a_slm(
 }
 
 // A-operand producers for gemv_body.
-template <int MP>
+template <int MP, typename Scalar = sycl::half>
 struct GlobalA {
-  const sycl::half* a;
+  const Scalar* a;
   int K, M, pitch_bytes;
   inline void
   operator()(const sycl::sub_group&, int kc, int, AOps<MP>& A) const {
@@ -221,7 +260,7 @@ struct SlmA {
 };
 
 // ----------------------------------------------------------- compute -----
-template <int MP>
+template <int MP, typename Scalar>
 static inline void compute_chunk(
     const u32x8 (&wr)[kChunkSteps],
     const AOps<MP>& A,
@@ -233,20 +272,21 @@ static inline void compute_chunk(
     cute::intel::int8 be, bo;
   #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      be[i] = int(e4m3_even(wr[t][i]));
-      bo[i] = int(e4m3_odd(wr[t][i]));
+      be[i] = int(e4m3_even<Scalar>(wr[t][i]));
+      bo[i] = int(e4m3_odd<Scalar>(wr[t][i]));
     }
-    Dpas<MP>::mma(acc_even, A.e[t], be);
-    Dpas<MP>::mma(acc_odd, A.o[t], bo);
+    Dpas<MP, Scalar>::mma(acc_even, A.e[t], be);
+    Dpas<MP, Scalar>::mma(acc_odd, A.o[t], bo);
   }
 #endif
 }
 
 // One weight matrix handled by a contiguous range of work-groups.
+template <typename Scalar = sycl::half>
 struct Seg {
   const uint8_t* w;    // [N, K] row-major E4M3
   const float* scale;  // [1]
-  sycl::half* out;     // [M, N], row stride out_stride (elements)
+  Scalar* out;         // [M, N], row stride out_stride (elements)
   int N;
   int out_stride;
   int wg_begin;  // first work-group of this segment
@@ -273,10 +313,17 @@ static inline int chunk_of(int ks, int i) {
 // chunks into wpre (lets them overlap a prologue); see preload_w().
 // CPS > 0: compile-time chunks per sub-group (K == CPS * KS * 64); the loop
 // is fully unrolled so A producers may keep per-chunk data in registers.
-template <int MP, int KS, int RG, class ALoad, int PRE = 1, int CPS = 0>
+template <
+    int MP,
+    int KS,
+    int RG,
+    class ALoad,
+    int PRE = 1,
+    int CPS = 0,
+    typename Scalar = sycl::half>
 static inline void gemv_body(
     const sycl::nd_item<1>& item,
-    const Seg& seg,
+    const Seg<Scalar>& seg,
     int wg_row0,
     const ALoad& load_a_fn,
     float* slm_part,
@@ -284,7 +331,7 @@ static inline void gemv_body(
     int K,
     const u32x8 (&wpre)[PRE][kChunkSteps],
     bool w_preloaded) {
-  using D = Dpas<MP>;
+  using D = Dpas<MP, Scalar>;
   auto sg = item.get_sub_group();
   const int lane = sg.get_local_linear_id();
   const int sgid = sg.get_group_linear_id();
@@ -301,7 +348,7 @@ static inline void gemv_body(
   auto step = [&](int it, int c, const u32x8(&wr)[kChunkSteps]) {
     AOps<MP> A;
     load_a_fn(sg, c * kChunkK, it, A);
-    compute_chunk<MP>(wr, A, acc_e, acc_o);
+    compute_chunk<MP, Scalar>(wr, A, acc_e, acc_o);
   };
   if (active) {
     if constexpr (CPS > 0) {
@@ -350,7 +397,7 @@ static inline void gemv_body(
       for (int i = 0; i < MP; ++i)
         if (i < M)
           seg.out[int64_t(i) * seg.out_stride + n] =
-              sycl::half(vget<MP>(acc_e, i) * s);
+              Scalar(vget<MP>(acc_e, i) * s);
     }
   } else {
     // partials: [rg][ks][i][lane]
@@ -367,7 +414,7 @@ static inline void gemv_body(
 #pragma unroll
           for (int q = 0; q < KS; ++q)
             v += slm_part[(q * MP + i) * kSg + lane];
-          seg.out[int64_t(i) * seg.out_stride + n] = sycl::half(v * s);
+          seg.out[int64_t(i) * seg.out_stride + n] = Scalar(v * s);
         }
       }
     } else {
@@ -387,17 +434,17 @@ static inline void gemv_body(
           v[u] = acc * s;
         }
         const int n0 = wg_row0 + r_first;
-        sycl::half* o = seg.out + int64_t(i) * seg.out_stride + n0;
+        Scalar* o = seg.out + int64_t(i) * seg.out_stride + n0;
         if (n0 + RG <= seg.N && (seg.out_stride % RG) == 0) {
-          sycl::vec<sycl::half, RG> hv;
+          sycl::vec<uint16_t, RG> hv;
 #pragma unroll
           for (int u = 0; u < RG; ++u)
-            hv[u] = sycl::half(v[u]);
-          *reinterpret_cast<sycl::vec<sycl::half, RG>*>(o) = hv;
+            hv[u] = sycl::bit_cast<uint16_t>(Scalar(v[u]));
+          *reinterpret_cast<sycl::vec<uint16_t, RG>*>(o) = hv;
         } else {
 #pragma unroll
           for (int u = 0; u < RG; ++u)
-            if (n0 + u < seg.N) o[u] = sycl::half(v[u]);
+            if (n0 + u < seg.N) o[u] = Scalar(v[u]);
         }
       }
     }
@@ -406,9 +453,13 @@ static inline void gemv_body(
 
 // Issue the weight loads of this sub-group's first PRE chunks for
 // gemv_body(..., wpre, true); returns false if the rows are out of range.
-template <int PRE, int KS>
+template <int PRE, int KS, typename Scalar>
 static inline bool preload_w(
-    const Seg& seg, int row0, int ks, int K, u32x8 (&wpre)[PRE][kChunkSteps]) {
+    const Seg<Scalar>& seg,
+    int row0,
+    int ks,
+    int K,
+    u32x8 (&wpre)[PRE][kChunkSteps]) {
   if (row0 >= seg.N) return false;
   const int nchunks = K / kChunkK;
 #pragma unroll
@@ -422,10 +473,10 @@ static inline bool preload_w(
 // Stage a[M, K] (fp16, row pitch in elements) into the SLM A image; rows
 // M..MP-1 are zero-filled. Work-group cooperative; caller barriers.
 // Each work-item moves 4 consecutive dwords (8 fp16, 16 B) per iteration.
-template <int MP>
+template <int MP, typename Scalar>
 static inline void stage_a_slm(
     const sycl::nd_item<1>& item,
-    const sycl::half* a,
+    const Scalar* a,
     int64_t pitch,
     int M,
     int K,

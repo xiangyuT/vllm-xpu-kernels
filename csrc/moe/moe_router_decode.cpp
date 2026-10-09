@@ -1,4 +1,5 @@
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
 #include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 
 #include <ATen/DeviceGuard.h>
@@ -13,15 +14,15 @@
 namespace vllm {
 namespace moe {
 
-// MoE router for small-M decode (M <= 8 tokens), ONE kernel launch:
-//   [norm variant]  s = x + residual; residual_out = fp16(s);
-//                   normed_out = fp16(s * rsqrt(mean(s^2) + eps) * (1 + g))
-//   logits = fp16(a @ W^T)   (a = x or normed; fp16 W, fp32 accumulate,
-//                             rounded to fp16 like an fp16 F.linear)
+// MoE router for small-M decode (M <= 16 tokens), ONE kernel launch:
+//   [norm variant]  s = x + residual; residual_out = input_dtype(s);
+//                   normed_out = input_dtype(s * rsqrt(mean(s^2) + eps) * (1 +
+//                   g))
+//   logits = input_dtype(a @ W^T) (matching FP16/BF16 a and W, FP32 accumulate)
 //   softmax over E, top-k, optional renormalization (== topk_softmax).
 //
 // GEMV: a work-group (32 sub-groups) owns kExpPerWg = 8 experts and up to
-//   kMaxRows = 4 token rows (M > 4: a second row group of work-groups). A
+//   kMaxRows = 4 token rows (M > 4: multiple row groups of work-groups). A
 //   sub-group computes kR = 4 experts x one 128-wide K block; kKSplit = 16
 //   sub-groups cover K = 2048. All accesses to 128-element blocks are
 //   sub-group block loads/stores (striped: lane l owns elements l + 16 j).
@@ -31,7 +32,7 @@ namespace moe {
 //   E = 256: 32 work-groups (one per Xe core) per row group.
 // Top-k: the last work-group to finish (device-scope ticket that resets
 //   itself) reads the M x E logits back, one sub-group per token. Keys are
-//   order-preserving fp16 logit bits << 16 | (0xffff - expert) (ties ->
+//   order-preserving FP16/BF16 logit bits << 16 | (0xffff - expert) (ties ->
 //   lowest id). top_k <= 8: each lane sorts its keys into a top-8 list and 4
 //   xor-shuffle bitonic merges leave the sub-group's top-8 in every lane;
 //   top_k <= 16: repeated sub-group arg-max. Softmax only for the picks
@@ -48,7 +49,7 @@ namespace moe {
 //   all its reads have completed; the work-group completing the count writes
 //   the row group's normed_out (from SLM) / residual_out, after its ticket
 //   so the stores stay off the critical path.
-// Constraints: M <= 8, E <= 512, top_k <= 16, K % 128 == 0 (norm variant:
+// Constraints: M <= 16, E <= 512, top_k <= 16, K % 128 == 0 (norm variant:
 //   K <= 6144), 16-byte aligned rows. Launches on one queue must not overlap
 //   (in-order queue; the counters are per queue).
 constexpr int kRouterSg = 16;
@@ -59,7 +60,7 @@ constexpr int kEGroups = kSgPerWg / kKSplit;
 constexpr int kExpPerWg = kR * kEGroups;
 constexpr int kWgSize = kRouterSg * kSgPerWg;
 constexpr int kMaxRows = 4;  // token rows per work-group
-constexpr int kRouterMaxM = 8;
+constexpr int kRouterMaxM = 16;
 constexpr int kRouterMaxEpl = 32;      // up to 512 experts
 constexpr int kBlk = kRouterSg * 8;    // K elements per sub-group block
 constexpr int kRouterNormMaxK = 6144;  // norm variant: MR x K fp16 in SLM
@@ -70,24 +71,28 @@ static_assert(kExpPerWg * kMaxRows <= kWgSize, "");
 
 // 8 fp16 values per lane. (A plain array rather than sycl::vec: writes to
 // sycl::vec elements were kept in private memory by the compiler.)
-struct alignas(16) half8 {
-  sycl::half h[8];
-  sycl::half& operator[](int j) { return h[j]; }
-  const sycl::half& operator[](int j) const { return h[j]; }
+template <typename Scalar>
+struct alignas(16) Scalar8 {
+  Scalar h[8];
+  Scalar& operator[](int j) { return h[j]; }
+  const Scalar& operator[](int j) const { return h[j]; }
 };
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
-// Sub-group block load / store of 128 contiguous fp16 (16-byte aligned).
-static inline half8 sg_load8(const sycl::sub_group& sg, const sycl::half* p) {
-  half8 v;
+// Sub-group block load / store of 128 contiguous matching fp16/bf16 (16-byte
+// aligned).
+template <typename Scalar>
+static inline Scalar8<Scalar>
+sg_load8(const sycl::sub_group& sg, const Scalar* p) {
+  Scalar8<Scalar> v;
   syclex::group_load(
       sg,
       sycl::address_space_cast<
           sycl::access::address_space::global_space,
           sycl::access::decorated::yes>(p)
           .get_decorated(),
-      sycl::span<sycl::half, 8>(v.h),
+      sycl::span<Scalar, 8>(v.h),
       syclex::properties{
           syclex::data_placement_striped,
           syclex::full_group,
@@ -95,11 +100,12 @@ static inline half8 sg_load8(const sycl::sub_group& sg, const sycl::half* p) {
   return v;
 }
 
+template <typename Scalar>
 static inline void
-sg_store8(const sycl::sub_group& sg, sycl::half* p, const half8& v) {
+sg_store8(const sycl::sub_group& sg, Scalar* p, const Scalar8<Scalar>& v) {
   syclex::group_store(
       sg,
-      sycl::span<const sycl::half, 8>(v.h),
+      sycl::span<const Scalar, 8>(v.h),
       sycl::address_space_cast<
           sycl::access::address_space::global_space,
           sycl::access::decorated::yes>(p)
@@ -121,10 +127,11 @@ struct RouterSync {
   } reads_done[kMaxRowGroups];
 };
 
+template <typename Scalar>
 struct RouterArgs {
-  const sycl::half* x;
+  const Scalar* x;
   int64_t x_stride;
-  const sycl::half* w;
+  const Scalar* w;
   float* logits;
   float* topk_weights;
   int32_t* topk_ids;
@@ -133,12 +140,12 @@ struct RouterArgs {
   int nwg_e;  // work-groups per row group
   bool renormalize;
   // norm variant only
-  const sycl::half* residual;
+  const Scalar* residual;
   int64_t res_stride;
-  const sycl::half* norm_w;
-  sycl::half* normed_out;
+  const Scalar* norm_w;
+  Scalar* normed_out;
   int64_t normed_stride;
-  sycl::half* residual_out;
+  Scalar* residual_out;
   int64_t res_out_stride;
   float eps;
 };
@@ -150,21 +157,25 @@ using router_atomic = sycl::atomic_ref<
     sycl::memory_scope::device,
     sycl::access::address_space::global_space>;
 
+template <typename Scalar>
 static inline uint32_t router_key(float logit, int e) {
-  const uint16_t h = sycl::bit_cast<uint16_t>(static_cast<sycl::half>(logit));
+  const uint16_t h = sycl::bit_cast<uint16_t>(static_cast<Scalar>(logit));
   const uint16_t o = (h & 0x8000) ? static_cast<uint16_t>(~h)
                                   : static_cast<uint16_t>(h | 0x8000);
   return (static_cast<uint32_t>(o) << 16) | static_cast<uint32_t>(0xffff - e);
 }
 
+template <typename Scalar>
 static inline float router_key_logit(uint32_t key) {
   const uint16_t o = static_cast<uint16_t>(key >> 16);
   const uint16_t h = (o & 0x8000) ? static_cast<uint16_t>(o & 0x7fff)
                                   : static_cast<uint16_t>(~o);
-  return static_cast<float>(sycl::bit_cast<sycl::half>(h));
+  return static_cast<float>(sycl::bit_cast<Scalar>(h));
 }
 
-static inline float router_dot8(const half8& u, const half8& v, float acc) {
+template <typename Scalar>
+static inline float
+router_dot8(const Scalar8<Scalar>& u, const Scalar8<Scalar>& v, float acc) {
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
     acc = sycl::fma(static_cast<float>(u[j]), static_cast<float>(v[j]), acc);
@@ -172,7 +183,9 @@ static inline float router_dot8(const half8& u, const half8& v, float acc) {
   return acc;
 }
 
-static inline float router_sumsq8(const half8& xv, const half8& rv, float acc) {
+template <typename Scalar>
+static inline float
+router_sumsq8(const Scalar8<Scalar>& xv, const Scalar8<Scalar>& rv, float acc) {
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
     const float s = static_cast<float>(xv[j]) + static_cast<float>(rv[j]);
@@ -181,24 +194,29 @@ static inline float router_sumsq8(const half8& xv, const half8& rv, float acc) {
   return acc;
 }
 
-// normed = fp16(((x + r) * rs) * (1 + g)), fp32 math
-static inline half8
-router_norm8(const half8& xv, const half8& rv, const half8& gv, float rs) {
-  half8 o;
+// normed = input_dtype(((x + r) * rs) * (1 + g)), FP32 math
+template <typename Scalar>
+static inline Scalar8<Scalar> router_norm8(
+    const Scalar8<Scalar>& xv,
+    const Scalar8<Scalar>& rv,
+    const Scalar8<Scalar>& gv,
+    float rs) {
+  Scalar8<Scalar> o;
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
     const float s = static_cast<float>(xv[j]) + static_cast<float>(rv[j]);
-    o[j] =
-        static_cast<sycl::half>((s * rs) * (static_cast<float>(gv[j]) + 1.0f));
+    o[j] = static_cast<Scalar>((s * rs) * (static_cast<float>(gv[j]) + 1.0f));
   }
   return o;
 }
 
-static inline half8 router_add8(const half8& xv, const half8& rv) {
-  half8 o;
+template <typename Scalar>
+static inline Scalar8<Scalar>
+router_add8(const Scalar8<Scalar>& xv, const Scalar8<Scalar>& rv) {
+  Scalar8<Scalar> o;
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    o[j] = static_cast<sycl::half>(
+    o[j] = static_cast<Scalar>(
         static_cast<float>(xv[j]) + static_cast<float>(rv[j]));
   }
   return o;
@@ -269,13 +287,13 @@ struct RouterSlm {
 
 // MR: rows per work-group (compile time); this work-group's rows are
 // [row0, row0 + mloc), mloc <= MR. EPL: logits per lane in the top-k.
-template <int MR, int EPL, bool NORM>
+template <int MR, int EPL, bool NORM, typename Scalar>
 class router_kernel {
   // norm variant: split the rows between the expert groups
   static constexpr bool kSplitRows = MR >= 3;
 
  public:
-  router_kernel(RouterArgs a, sycl::local_accessor<float, 1> slm)
+  router_kernel(RouterArgs<Scalar> a, sycl::local_accessor<float, 1> slm)
       : a(a), slm(slm) {}
 
   [[sycl::reqd_sub_group_size(kRouterSg)]] void
@@ -297,21 +315,21 @@ class router_kernel {
     float* s_part = &slm[0];
     float* s_ssq = s_part + Slm::kPart;
     // norm: normed rows [MR][nblk][16 lanes][8], after the fixed part
-    [[maybe_unused]] sycl::half* s_nrm =
-        reinterpret_cast<sycl::half*>(s_part + Slm::kFloats);
+    [[maybe_unused]] Scalar* s_nrm =
+        reinterpret_cast<Scalar*>(s_part + Slm::kFloats);
     int* s_flag = reinterpret_cast<int*>(s_ssq + Slm::kSsq);
 
     // ---- W loads for the first K block go out before anything else ----
     const int eg = sgid / kKSplit;
     const int ks = sgid % kKSplit;
     const int e0 = gid_e * kExpPerWg + eg * kR;
-    const sycl::half* wr[kR];
+    const Scalar* wr[kR];
 #pragma unroll
     for (int r = 0; r < kR; ++r) {
       const int e = e0 + r < E ? e0 + r : E - 1;  // clamp; result dropped
       wr[r] = a.w + static_cast<int64_t>(e) * K;
     }
-    half8 wv[kR];
+    Scalar8<Scalar> wv[kR];
     auto load_w = [&](int b) {
       // (index clamp instead of an aggregate ?:, which goes to memory)
       const int bb = b < nblk ? b : 0;
@@ -323,13 +341,15 @@ class router_kernel {
 
     // Row m of this work-group (rows past mloc re-read row0; dropped).
     auto row = [&](int m) { return row0 + (m < mloc ? m : 0); };
-    auto load_rows =
-        [&](const sycl::half* base, int64_t stride, int k, half8(&out)[MR]) {
+    auto load_rows = [&](const Scalar* base,
+                         int64_t stride,
+                         int k,
+                         Scalar8<Scalar>(&out)[MR]) {
 #pragma unroll
-          for (int m = 0; m < MR; ++m) {
-            out[m] = sg_load8(sg, base + row(m) * stride + k);
-          }
-        };
+      for (int m = 0; m < MR; ++m) {
+        out[m] = sg_load8(sg, base + row(m) * stride + k);
+      }
+    };
 
     float acc[kR][MR];
 #pragma unroll
@@ -338,7 +358,7 @@ class router_kernel {
       for (int m = 0; m < MR; ++m)
         acc[r][m] = 0.f;
     }
-    auto gemv_block = [&](const half8(&xb)[MR]) {
+    auto gemv_block = [&](const Scalar8<Scalar>(&xb)[MR]) {
 #pragma unroll
       for (int m = 0; m < MR; ++m) {
 #pragma unroll
@@ -363,7 +383,7 @@ class router_kernel {
       auto own = [&](int i) { return kSplit ? eg + i * kEGroups : i; };
       const bool has0 = ks < nblk;
       const int k0 = (has0 ? ks : 0) * kBlk;
-      half8 xv0[kOwnRows], rv0[kOwnRows];
+      Scalar8<Scalar> xv0[kOwnRows], rv0[kOwnRows];
 #pragma unroll
       for (int i = 0; i < kOwnRows; ++i) {
         if (own(i) < MR) {  // (uniform per sub-group)
@@ -371,7 +391,7 @@ class router_kernel {
           rv0[i] = sg_load8(sg, a.residual + row(own(i)) * a.res_stride + k0);
         }
       }
-      const half8 gv0 = sg_load8(sg, a.norm_w + k0);
+      const Scalar8<Scalar> gv0 = sg_load8(sg, a.norm_w + k0);
       // Pass 1: this sub-group's share of sum((x + r)^2) of its rows.
       float ss[kOwnRows];
 #pragma unroll
@@ -383,8 +403,9 @@ class router_kernel {
         for (int i = 0; i < kOwnRows; ++i) {
           if (own(i) < MR) {
             const int k = b * kBlk;
-            const half8 xv = sg_load8(sg, a.x + row(own(i)) * a.x_stride + k);
-            const half8 rv =
+            const Scalar8<Scalar> xv =
+                sg_load8(sg, a.x + row(own(i)) * a.x_stride + k);
+            const Scalar8<Scalar> rv =
                 sg_load8(sg, a.residual + row(own(i)) * a.res_stride + k);
             ss[i] = router_sumsq8(xv, rv, ss[i]);
           }
@@ -408,7 +429,8 @@ class router_kernel {
             router_atomic<unsigned int>(a.sync->reads_done[rg].n)
                 .fetch_add(1u) == static_cast<unsigned int>(a.nwg_e - 1);
       }
-      half8* s_nv = reinterpret_cast<half8*>(s_nrm);  // [MR][nblk][16]
+      Scalar8<Scalar>* s_nv =
+          reinterpret_cast<Scalar8<Scalar>*>(s_nrm);  // [MR][nblk][16]
       const bool keeper = kSplit || eg == 0;
       float rs[kOwnRows];
 #pragma unroll
@@ -423,7 +445,7 @@ class router_kernel {
       // Pass 2: normalize the own rows (MR <= 2: and run the GEMV on them).
       for (int b = ks; b < nblk; b += kKSplit) {
         const int k = b * kBlk;
-        half8 nv[kOwnRows];
+        Scalar8<Scalar> nv[kOwnRows];
         if (b == ks) {
 #pragma unroll
           for (int i = 0; i < kOwnRows; ++i) {
@@ -431,12 +453,13 @@ class router_kernel {
           }
         } else {  // K > 2048
           load_w(b);
-          const half8 gv = sg_load8(sg, a.norm_w + k);
+          const Scalar8<Scalar> gv = sg_load8(sg, a.norm_w + k);
 #pragma unroll
           for (int i = 0; i < kOwnRows; ++i) {
             if (own(i) < MR) {
-              const half8 xv = sg_load8(sg, a.x + row(own(i)) * a.x_stride + k);
-              const half8 rv =
+              const Scalar8<Scalar> xv =
+                  sg_load8(sg, a.x + row(own(i)) * a.x_stride + k);
+              const Scalar8<Scalar> rv =
                   sg_load8(sg, a.residual + row(own(i)) * a.res_stride + k);
               nv[i] = router_norm8(xv, rv, gv, rs[i]);
             }
@@ -467,7 +490,7 @@ class router_kernel {
         // unless K > 2048)
         for (int b = ks; b < nblk; b += kKSplit) {
           if (nblk > kKSplit) load_w(b);
-          half8 nv[MR];
+          Scalar8<Scalar> nv[MR];
 #pragma unroll
           for (int m = 0; m < MR; ++m) {
             nv[m] = s_nv[((row(m) - row0) * nblk + b) * kRouterSg + lane];
@@ -478,7 +501,7 @@ class router_kernel {
     } else {
       for (int b = ks; b < nblk; b += kKSplit) {
         if (b != ks) load_w(b);
-        half8 xv[MR];
+        Scalar8<Scalar> xv[MR];
         load_rows(a.x, a.x_stride, b * kBlk, xv);
         gemv_block(xv);
       }
@@ -530,7 +553,7 @@ class router_kernel {
           t += s_part[(egl * kKSplit + q) * Slm::kPartStride + i];
         }
         a.logits[(row0 + m) * E + eo] =
-            static_cast<float>(static_cast<sycl::half>(t));
+            static_cast<float>(static_cast<Scalar>(t));
       }
     }
 
@@ -566,10 +589,11 @@ class router_kernel {
       if (s_flag[0] && sgid >= first) {
         for (int p = sgid - first; p < nblk * mloc; p += kSgPerWg - first) {
           const int b = p % nblk, m = p / nblk, k = b * kBlk;
-          const half8 nv = reinterpret_cast<const half8*>(
+          const Scalar8<Scalar> nv = reinterpret_cast<const Scalar8<Scalar>*>(
               s_nrm)[(m * nblk + b) * kRouterSg + lane];
-          const half8 xv = sg_load8(sg, a.x + (row0 + m) * a.x_stride + k);
-          const half8 rv =
+          const Scalar8<Scalar> xv =
+              sg_load8(sg, a.x + (row0 + m) * a.x_stride + k);
+          const Scalar8<Scalar> rv =
               sg_load8(sg, a.residual + (row0 + m) * a.res_stride + k);
           sg_store8(sg, a.normed_out + (row0 + m) * a.normed_stride + k, nv);
           sg_store8(
@@ -606,7 +630,7 @@ class router_kernel {
 #pragma unroll
     for (int i = 0; i < EPL; ++i) {
       const int ee = lane + i * kRouterSg;
-      key[i] = ee < E ? router_key(v[i], ee) : 0u;
+      key[i] = ee < E ? router_key<Scalar>(v[i], ee) : 0u;
     }
     uint32_t sel = 0;  // lane j ends up with pick j
     if (a.top_k <= 8) {
@@ -661,9 +685,10 @@ class router_kernel {
       }
     }
     // Lane 0 holds the largest logit.
-    const float mx = router_key_logit(sycl::group_broadcast(sg, sel, 0));
+    const float mx =
+        router_key_logit<Scalar>(sycl::group_broadcast(sg, sel, 0));
     const float p =
-        lane < a.top_k ? sycl::exp(router_key_logit(sel) - mx) : 0.f;
+        lane < a.top_k ? sycl::exp(router_key_logit<Scalar>(sel) - mx) : 0.f;
     float denom;
     if (a.renormalize) {
       denom = sycl::reduce_over_group(sg, p, sycl::plus<float>());
@@ -683,7 +708,7 @@ class router_kernel {
   }
 
  private:
-  RouterArgs a;
+  RouterArgs<Scalar> a;
   sycl::local_accessor<float, 1> slm;
 };
 
@@ -701,8 +726,8 @@ static RouterSync* router_sync(sycl::queue& q) {
   return p;
 }
 
-template <int MR, int EPL, bool NORM>
-static void router_launch(sycl::queue& q, RouterArgs a) {
+template <int MR, int EPL, bool NORM, typename Scalar>
+static void router_launch(sycl::queue& q, RouterArgs<Scalar> a) {
   a.nwg_e = (a.E + kExpPerWg - 1) / kExpPerWg;
   const int nrg = (a.M + MR - 1) / MR;
   const int64_t num_wg = static_cast<int64_t>(a.nwg_e) * nrg;
@@ -711,12 +736,12 @@ static void router_launch(sycl::queue& q, RouterArgs a) {
         sycl::range<1>(RouterSlm<MR>::floats(NORM, a.K)), cgh);
     cgh.parallel_for(
         sycl::nd_range<1>(num_wg * kWgSize, kWgSize),
-        router_kernel<MR, EPL, NORM>(a, slm));
+        router_kernel<MR, EPL, NORM, Scalar>(a, slm));
   });
 }
 
-template <int MR, bool NORM>
-static void router_dispatch_e(sycl::queue& q, const RouterArgs& a) {
+template <int MR, bool NORM, typename Scalar>
+static void router_dispatch_e(sycl::queue& q, const RouterArgs<Scalar>& a) {
   if (a.E <= 8 * kRouterSg) {
     router_launch<MR, 8, NORM>(q, a);
   } else if (a.E <= 16 * kRouterSg) {
@@ -726,9 +751,9 @@ static void router_dispatch_e(sycl::queue& q, const RouterArgs& a) {
   }
 }
 
-// M <= 4: one row group of M rows; M > 4: two row groups of <= 4 rows.
-template <bool NORM>
-static void router_dispatch(sycl::queue& q, const RouterArgs& a) {
+// M <= 4: one row group of M rows; M > 4: multiple row groups of <= 4 rows.
+template <bool NORM, typename Scalar>
+static void router_dispatch(sycl::queue& q, const RouterArgs<Scalar>& a) {
   switch (a.M) {
     case 1:
       router_dispatch_e<1, NORM>(q, a);
@@ -765,20 +790,23 @@ static void router_check_common(
     const torch::Tensor& topk_weights,
     const torch::Tensor& topk_ids) {
   TORCH_CHECK(
-      x.dim() == 2 && x.scalar_type() == at::kHalf && x.stride(1) == 1,
+      x.dim() == 2 &&
+          (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) &&
+          x.stride(1) == 1,
       name,
-      ": x must be fp16 [M, K] with unit inner stride");
+      ": x must be fp16/bf16 [M, K] with unit inner stride");
   TORCH_CHECK(
-      router_weight.dim() == 2 && router_weight.scalar_type() == at::kHalf &&
+      router_weight.dim() == 2 &&
+          router_weight.scalar_type() == x.scalar_type() &&
           router_weight.is_contiguous(),
       name,
-      ": router_weight must be contiguous fp16 [E, K]");
+      ": router_weight must be contiguous matching fp16/bf16 [E, K]");
   const int64_t M = x.size(0);
   const int64_t K = x.size(1);
   const int64_t E = router_weight.size(0);
   const int64_t top_k = topk_ids.size(-1);
   TORCH_CHECK(router_weight.size(1) == K, name, ": K mismatch");
-  TORCH_CHECK(M <= kRouterMaxM, name, ": at most 8 tokens");
+  TORCH_CHECK(M <= kRouterMaxM, name, ": at most 16 tokens");
   TORCH_CHECK(K % kBlk == 0, name, ": K must be a multiple of 128");
   TORCH_CHECK(
       E <= kRouterSg * kRouterMaxEpl && top_k >= 1 && top_k <= kRouterSg &&
@@ -801,7 +829,8 @@ static void router_check_common(
       topk_ids.numel() == M * top_k);
 }
 
-static RouterArgs router_make_args(
+template <typename Scalar>
+static RouterArgs<Scalar> router_make_args(
     const torch::Tensor& x,
     const torch::Tensor& router_weight,
     torch::Tensor& logits,
@@ -809,10 +838,10 @@ static RouterArgs router_make_args(
     torch::Tensor& topk_ids,
     bool renormalize,
     sycl::queue& queue) {
-  RouterArgs a{};
-  a.x = reinterpret_cast<const sycl::half*>(x.data_ptr());
+  RouterArgs<Scalar> a{};
+  a.x = reinterpret_cast<const Scalar*>(x.data_ptr());
   a.x_stride = x.stride(0);
-  a.w = reinterpret_cast<const sycl::half*>(router_weight.data_ptr());
+  a.w = reinterpret_cast<const Scalar*>(router_weight.data_ptr());
   a.logits = logits.data_ptr<float>();
   a.topk_weights = topk_weights.data_ptr<float>();
   a.topk_ids = topk_ids.data_ptr<int32_t>();
@@ -847,9 +876,16 @@ void router_gemv_topk_softmax(
   const int64_t M = x.size(0);
   if (M == 0) return;
   auto& queue = vllm::xpu::vllmGetQueue();
-  const RouterArgs a = router_make_args(
-      x, router_weight, logits, topk_weights, topk_ids, renormalize, queue);
-  router_dispatch<false>(queue, a);
+  auto launch = [&](auto scalar) {
+    using Scalar = decltype(scalar);
+    const RouterArgs<Scalar> a = router_make_args<Scalar>(
+        x, router_weight, logits, topk_weights, topk_ids, renormalize, queue);
+    router_dispatch<false>(queue, a);
+  };
+  if (x.scalar_type() == at::kHalf)
+    launch(sycl::half{});
+  else
+    launch(sycl::ext::oneapi::bfloat16{});
 }
 
 void router_resadd_norm_gemv_topk_softmax(
@@ -873,12 +909,12 @@ void router_resadd_norm_gemv_topk_softmax(
   auto check_act = [&](const torch::Tensor& t, const char* what) {
     TORCH_CHECK(
         t.dim() == 2 && t.size(0) == M && t.size(1) == K &&
-            t.scalar_type() == at::kHalf && t.stride(1) == 1 &&
+            t.scalar_type() == x.scalar_type() && t.stride(1) == 1 &&
             t.stride(0) % 8 == 0 && router_aligned16(t.data_ptr()),
         name,
         ": ",
         what,
-        " must be fp16 [M, K], unit inner stride, 16-byte aligned rows");
+        " must be fp16/bf16 [M, K], unit inner stride, 16-byte aligned rows");
   };
   check_act(residual, "residual");
   check_act(normed_out, "normed_out");
@@ -891,22 +927,30 @@ void router_resadd_norm_gemv_topk_softmax(
       " (normed rows are staged in SLM)");
   TORCH_CHECK(
       norm_weight.dim() == 1 && norm_weight.size(0) == K &&
-          norm_weight.scalar_type() == at::kHalf &&
+          norm_weight.scalar_type() == x.scalar_type() &&
           norm_weight.is_contiguous() &&
           router_aligned16(norm_weight.data_ptr()),
       name,
-      ": norm_weight must be contiguous 16-byte aligned fp16 [K]");
+      ": norm_weight must be contiguous 16-byte aligned matching fp16/bf16 "
+      "[K]");
   if (M == 0) return;
   auto& queue = vllm::xpu::vllmGetQueue();
-  RouterArgs a = router_make_args(
-      x, router_weight, logits, topk_weights, topk_ids, renormalize, queue);
-  a.residual = reinterpret_cast<const sycl::half*>(residual.data_ptr());
-  a.res_stride = residual.stride(0);
-  a.norm_w = reinterpret_cast<const sycl::half*>(norm_weight.data_ptr());
-  a.normed_out = reinterpret_cast<sycl::half*>(normed_out.data_ptr());
-  a.normed_stride = normed_out.stride(0);
-  a.residual_out = reinterpret_cast<sycl::half*>(residual_out.data_ptr());
-  a.res_out_stride = residual_out.stride(0);
-  a.eps = static_cast<float>(eps);
-  router_dispatch<true>(queue, a);
+  auto launch = [&](auto scalar) {
+    using Scalar = decltype(scalar);
+    RouterArgs<Scalar> a = router_make_args<Scalar>(
+        x, router_weight, logits, topk_weights, topk_ids, renormalize, queue);
+    a.residual = reinterpret_cast<const Scalar*>(residual.data_ptr());
+    a.res_stride = residual.stride(0);
+    a.norm_w = reinterpret_cast<const Scalar*>(norm_weight.data_ptr());
+    a.normed_out = reinterpret_cast<Scalar*>(normed_out.data_ptr());
+    a.normed_stride = normed_out.stride(0);
+    a.residual_out = reinterpret_cast<Scalar*>(residual_out.data_ptr());
+    a.res_out_stride = residual_out.stride(0);
+    a.eps = static_cast<float>(eps);
+    router_dispatch<true>(queue, a);
+  };
+  if (x.scalar_type() == at::kHalf)
+    launch(sycl::half{});
+  else
+    launch(sycl::ext::oneapi::bfloat16{});
 }

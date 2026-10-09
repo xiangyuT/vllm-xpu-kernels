@@ -5,7 +5,7 @@ Wraps ``torch.ops._xpu_C.moe_shared_fused_decode_interface``: routed experts
 and the single sigmoid-gated shared expert run in one op (six kernels, no
 per-call allocation).
 
-Only fp16 activations with fp8-e4m3 per-tensor (per-expert) weights and fp32
+FP16 or BF16 activations with fp8-e4m3 per-tensor (per-expert) weights and fp32
 scalar scales are supported, with SiLU activation and no bias. The output is
 the per-rank partial sum (tensor-parallel reduction is left to the caller).
 """
@@ -16,7 +16,7 @@ import torch
 _MAX_ROUTED_ROWS = 512
 # Limits of torch.ops._moe_C.router_gemv_topk_softmax (and of the fused
 # residual-add + RMSNorm variant, which also needs K <= 6144).
-_ROUTER_MAX_TOKENS = 8
+_ROUTER_MAX_TOKENS = 16
 _ROUTER_NORM_MAX_HIDDEN = 6144
 _ROUTER_MAX_EXPERTS = 512
 _ROUTER_MAX_TOP_K = 16
@@ -43,11 +43,9 @@ def router_is_available() -> bool:
 def router_norm_supports(hidden_size: int) -> bool:
     """Whether the residual-add + RMSNorm router variant supports hidden_size
     (in addition to router_supports())."""
-    return (
-        router_is_available()
-        and hasattr(torch.ops._moe_C, "router_resadd_norm_gemv_topk_softmax")
-        and hidden_size <= _ROUTER_NORM_MAX_HIDDEN
-    )
+    return (router_is_available() and hasattr(
+        torch.ops._moe_C, "router_resadd_norm_gemv_topk_softmax")
+            and hidden_size <= _ROUTER_NORM_MAX_HIDDEN)
 
 
 def router_supports(
@@ -56,15 +54,13 @@ def router_supports(
     top_k: int,
     hidden_size: int,
 ) -> bool:
-    """Whether the fused router (fp16 router GEMV + softmax top-k) supports
-    this configuration (for up to 8 tokens per call)."""
-    return (
-        router_is_available()
-        and router_weight_dtype == torch.float16
-        and num_experts <= _ROUTER_MAX_EXPERTS
-        and 1 <= top_k <= min(_ROUTER_MAX_TOP_K, num_experts)
-        and hidden_size % 128 == 0
-    )
+    """Whether the fused FP16/BF16 router GEMV + softmax top-k supports
+    this configuration (for up to 16 tokens per call)."""
+    return (router_is_available()
+            and router_weight_dtype in (torch.float16, torch.bfloat16)
+            and num_experts <= _ROUTER_MAX_EXPERTS
+            and 1 <= top_k <= min(_ROUTER_MAX_TOP_K, num_experts)
+            and hidden_size % 128 == 0)
 
 
 def supports(
@@ -77,18 +73,15 @@ def supports(
 ) -> bool:
     """Whether the op supports this configuration.
 
-    Requires fp16 activations, fp8-e4m3 per-tensor weights,
+    Requires FP16/BF16 activations, fp8-e4m3 per-tensor weights,
     num_tokens * top_k <= 512, hidden_size % 16 == 0 and
     intermediate_size % 8 == 0.
     """
-    return (
-        is_available()
-        and hidden_states_dtype == torch.float16
-        and weight_dtype == torch.float8_e4m3fn
-        and num_tokens * top_k <= _MAX_ROUTED_ROWS
-        and hidden_size % 16 == 0
-        and intermediate_size % 8 == 0
-    )
+    return (is_available()
+            and hidden_states_dtype in (torch.float16, torch.bfloat16)
+            and weight_dtype == torch.float8_e4m3fn
+            and num_tokens * top_k <= _MAX_ROUTED_ROWS
+            and hidden_size % 16 == 0 and intermediate_size % 8 == 0)
 
 
 def moe_shared_fused_workspace_bytes(
@@ -109,13 +102,9 @@ def moe_shared_fused_workspace_bytes(
     o_wperm = align(4 * (3 * umt + 1 + rows))
     o_gate = align(o_wperm + 4 * rows)
     o_ap = align(o_gate + 4 * num_tokens)
-    return o_ap + 2 * (
-        rows * hidden_size
-        + (rows + num_tokens) * w13_n
-        + (rows + num_tokens) * w2_k
-        + rows * hidden_size
-        + num_tokens * hidden_size
-    )
+    return o_ap + 2 * (rows * hidden_size + (rows + num_tokens) * w13_n +
+                       (rows + num_tokens) * w2_k + rows * hidden_size +
+                       num_tokens * hidden_size)
 
 
 class XpuMoESharedFusedDecode:
@@ -126,11 +115,11 @@ class XpuMoESharedFusedDecode:
       w2  [E, I, H]  fp8-e4m3, w2_scales  [E] fp32
       shared_w13 [H, 2I] fp8-e4m3, shared_w13_scale [1] fp32
       shared_w2  [I, H]  fp8-e4m3, shared_w2_scale  [1] fp32
-      shared_gate [H] or [1, H] fp16
+      shared_gate [H] or [1, H] with the activation dtype
 
     tile_m selects the GEMM M-tile (8 or 16); 0 lets the op pick by M.
 
-    With router_weight ([E, H] fp16) set, forward_routed() also computes the
+    With router_weight ([E, H], activation dtype), forward_routed() computes the
     softmax top-k routing (renormalized if renormalize) in the op, for up to
     8 tokens per call.
     """
@@ -165,9 +154,8 @@ class XpuMoESharedFusedDecode:
         self.num_experts = w13.shape[0]
         self.tile_m = tile_m
         self._ws: dict[int, torch.Tensor] = {}
-        self.router_weight = (
-            router_weight.contiguous() if router_weight is not None else None
-        )
+        self.router_weight = (router_weight.contiguous()
+                              if router_weight is not None else None)
         self.renormalize = renormalize
         self._routing: dict[int, tuple[torch.Tensor, ...]] = {}
 
@@ -215,8 +203,8 @@ class XpuMoESharedFusedDecode:
         return output
 
     def route(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+            self,
+            hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Softmax top-k routing of hidden_states with router_weight.
 
         Returns (topk_weights fp32, topk_ids int32), [M, top_k] each; the
@@ -224,8 +212,7 @@ class XpuMoESharedFusedDecode:
         """
         assert self.router_weight is not None, "no router_weight given"
         logits, topk_weights, topk_ids = self._routing_buffers(
-            hidden_states.shape[0], hidden_states.device
-        )
+            hidden_states.shape[0], hidden_states.device)
         torch.ops._moe_C.router_gemv_topk_softmax(
             hidden_states,
             self.router_weight,
@@ -236,9 +223,8 @@ class XpuMoESharedFusedDecode:
         )
         return topk_weights, topk_ids
 
-    def _routing_buffers(
-        self, m: int, device: torch.device
-    ) -> tuple[torch.Tensor, ...]:
+    def _routing_buffers(self, m: int,
+                         device: torch.device) -> tuple[torch.Tensor, ...]:
         bufs = self._routing.get(m)
         if bufs is None:
             bufs = (
@@ -253,8 +239,8 @@ class XpuMoESharedFusedDecode:
         return bufs
 
     def forward_routed(
-        self, output: torch.Tensor, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+            self, output: torch.Tensor,
+            hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """route() + forward(); returns (output, topk_ids)."""
         topk_weights, topk_ids = self.route(hidden_states)
         out = self.forward(output, hidden_states, topk_weights, topk_ids)
