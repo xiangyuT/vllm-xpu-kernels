@@ -1,0 +1,202 @@
+[
+  {
+    "logical_device": 0,
+    "config": 0,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      233.5497527383268,
+      232.74017730727792,
+      232.77755244635046
+    ],
+    "median_us": 232.77755244635046,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 0,
+    "config": 1,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      246.8251739628613,
+      246.79350317455828,
+      246.17327726446092
+    ],
+    "median_us": 246.79350317455828,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 0,
+    "config": 2,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      249.35807450674474,
+      249.44875040091574,
+      249.39757422544062
+    ],
+    "median_us": 249.39757422544062,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 0,
+    "config": 3,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      241.07957142405212,
+      241.53649574145675,
+      242.6323771942407
+    ],
+    "median_us": 241.53649574145675,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 0,
+    "config": 4,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      237.7736964263022,
+      237.63084900565445,
+      237.836450105533
+    ],
+    "median_us": 237.7736964263022,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 1,
+    "config": 0,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      230.1615779288113,
+      230.26587441563606,
+      230.2421722561121
+    ],
+    "median_us": 230.2421722561121,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 1,
+    "config": 1,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      247.03224771656096,
+      247.15522886253893,
+      247.18825006857514
+    ],
+    "median_us": 247.15522886253893,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 1,
+    "config": 2,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      249.8238522093743,
+      249.4942513294518,
+      249.68947400338948
+    ],
+    "median_us": 249.68947400338948,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 1,
+    "config": 3,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      242.29710106737912,
+      242.55002499558032,
+      242.14439908973873
+    ],
+    "median_us": 242.29710106737912,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  },
+  {
+    "logical_device": 1,
+    "config": 4,
+    "mnk": [
+      1,
+      248192,
+      256
+    ],
+    "samples_us": [
+      238.21147624403238,
+      237.97604953870177,
+      237.84273071214557
+    ],
+    "median_us": 237.97604953870177,
+    "seed": 7,
+    "calls_per_sample": 40,
+    "warmup_calls": 4,
+    "numeric_reference": "BF16-rounded FP32 product of actual dequantized FP8 weights",
+    "numeric_checked_before_and_after_graph_replay": true
+  }
+]

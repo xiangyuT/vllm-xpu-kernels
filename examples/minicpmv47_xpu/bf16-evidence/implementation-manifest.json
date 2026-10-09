@@ -1,0 +1,97 @@
+{
+  "gpu_execution": false,
+  "evidence_class": "local_implementation_and_cpu_validation",
+  "repositories": [
+    {
+      "path": "/home/xiangyu/workspace/minicpm-v47-main-prep-20261008/vllm-bf16",
+      "branch": "dev/minicpmv47-bf16-fusions-20261008",
+      "base_revision": "8f3e461beebc37d665a2cc2ba805adea1617dc34",
+      "changed_files": [
+        "tests/compile/passes/test_xpu_fusion.py",
+        "tests/compile/test_config.py",
+        "vllm/_xpu_ops.py",
+        "vllm/compilation/passes/fusion/xpu_fusion.py",
+        "vllm/config/vllm.py"
+      ],
+      "file_sha256": {
+        "tests/compile/passes/test_xpu_fusion.py": "f0e200b133996e1146b3d1f8df2ad03298e5c2944da17791f44ad916df0eb6c6",
+        "tests/compile/test_config.py": "889d9959fbed68ad1c1cf57c08df3d2859f959bcbad58b3bcc70d299e0b9c84f",
+        "vllm/_xpu_ops.py": "ca17a14f8c97cc18632ce4c9c474962ce2ee1d42b259381e57ed425a4864201d",
+        "vllm/compilation/passes/fusion/xpu_fusion.py": "13537dd290843d11edf4ce7a891e807b8997e9b92ec1ddf56e5f3a36365ceedc",
+        "vllm/config/vllm.py": "ed223d82b6af71b0d68a9192f0f1e341207e7d3f1d68fc2042d33f8684fc0c33"
+      },
+      "patch": "vllm-bf16-final.patch",
+      "patch_sha256": "32ddee8484bf1b400dfccb97f5e5d0efd1309fe1161455607a0c399f171f6ded",
+      "python_ast_files": [
+        "tests/compile/passes/test_xpu_fusion.py",
+        "tests/compile/test_config.py",
+        "vllm/_xpu_ops.py",
+        "vllm/compilation/passes/fusion/xpu_fusion.py",
+        "vllm/config/vllm.py"
+      ],
+      "status": "M tests/compile/passes/test_xpu_fusion.py\n M tests/compile/test_config.py\n M vllm/_xpu_ops.py\n M vllm/compilation/passes/fusion/xpu_fusion.py\n M vllm/config/vllm.py"
+    },
+    {
+      "path": "/home/xiangyu/workspace/minicpm-v47-main-prep-20261008/kernels-bf16",
+      "branch": "dev/minicpmv47-bf16-kernels-20261008",
+      "base_revision": "bee39d9299538ce6e82a947443790450aa570f3c",
+      "changed_files": [
+        "csrc/moe/moe_router_decode.cpp",
+        "csrc/xpu/gemv/xe_2/fp8_gemv.hpp",
+        "csrc/xpu/gemv/xe_2/fp8_gemv_xe2.cpp",
+        "csrc/xpu/gemv/xe_2/norm_fp8_gemv_xe2.cpp",
+        "csrc/xpu/grouped_gemm/xe_2/moe_shared_fused_decode_xe2.cpp",
+        "tests/fused_moe/test_moe_shared_fused_decode.py",
+        "tests/fused_moe/test_router_gemv_topk_softmax.py",
+        "tests/test_fp8_gemv_dispatch.py",
+        "tests/test_norm_fp8_gemv.py",
+        "vllm_xpu_kernels/moe_shared_fused_interface.py"
+      ],
+      "file_sha256": {
+        "csrc/moe/moe_router_decode.cpp": "8e8377925dfbd53b3707b5606784d0ceef1204ce8892dd64800d1852ccaaf371",
+        "csrc/xpu/gemv/xe_2/fp8_gemv.hpp": "827ba32973179c9154546b2370034e7b6c6c589e9108682d9670f5dbb812e60d",
+        "csrc/xpu/gemv/xe_2/fp8_gemv_xe2.cpp": "420a700aefce89a2e123c4687e2d1f2c52a17c496b1c03f3903f33c071946281",
+        "csrc/xpu/gemv/xe_2/norm_fp8_gemv_xe2.cpp": "b9fcfa98587ecc20ebdbdc5717791206ea3510dd62519511aab0277ac7162003",
+        "csrc/xpu/grouped_gemm/xe_2/moe_shared_fused_decode_xe2.cpp": "bab8460364570ea511cdcddf0eff7e33b23da3973515372bcb1ec82a9bf8dab0",
+        "tests/fused_moe/test_moe_shared_fused_decode.py": "7c29463c35b72ccba5d1b651cfed01b048b99cf9662ca92e3b550f5371256dd2",
+        "tests/fused_moe/test_router_gemv_topk_softmax.py": "66bd76020a6e07da8f4ceecec03a38396953870a4c0e70ca16d7d289622dab87",
+        "tests/test_fp8_gemv_dispatch.py": "a43576e4189d3adec58decedfb75c89172c85148d4d6a5351d9ffe6663853fa1",
+        "tests/test_norm_fp8_gemv.py": "bf85527fffb5225f7c0ac873c1d6b825716bd2eb1134fbbb891fc9c9bd1e2b43",
+        "vllm_xpu_kernels/moe_shared_fused_interface.py": "ae94d4afd35aee4d624fa0442700ea97f0eed046690e7a1403359eeeb5f6750d"
+      },
+      "patch": "kernels-bf16-final.patch",
+      "patch_sha256": "c6c9b4023b73fdc3160753f55ecb86f2fb290cbd8f5814158c48615ddd733395",
+      "python_ast_files": [
+        "tests/fused_moe/test_moe_shared_fused_decode.py",
+        "tests/fused_moe/test_router_gemv_topk_softmax.py",
+        "tests/test_fp8_gemv_dispatch.py",
+        "tests/test_norm_fp8_gemv.py",
+        "vllm_xpu_kernels/moe_shared_fused_interface.py"
+      ],
+      "status": "M csrc/moe/moe_router_decode.cpp\n M csrc/xpu/gemv/xe_2/fp8_gemv.hpp\n M csrc/xpu/gemv/xe_2/fp8_gemv_xe2.cpp\n M csrc/xpu/gemv/xe_2/norm_fp8_gemv_xe2.cpp\n M csrc/xpu/grouped_gemm/xe_2/moe_shared_fused_decode_xe2.cpp\n M tests/fused_moe/test_moe_shared_fused_decode.py\n M tests/fused_moe/test_router_gemv_topk_softmax.py\n M tests/test_fp8_gemv_dispatch.py\n M tests/test_norm_fp8_gemv.py\n M vllm_xpu_kernels/moe_shared_fused_interface.py"
+    }
+  ],
+  "cpu_tests": {
+    "vllm": 59,
+    "kernels_python_dtype_contract": 4
+  },
+  "cpu_codec": {
+    "bf16_codes": 256,
+    "finite_fp16_codes": 254,
+    "packed_words": 1024,
+    "bf16_range_values": 3
+  },
+  "native_build_targets": [
+    "gemv_kernels_xe_2",
+    "grouped_gemm_xe_2",
+    "_moe_C"
+  ],
+  "native_build_limits": {
+    "aot_device_lists": "",
+    "oneDNN": false,
+    "full_xpu_extension_or_wheel": false
+  },
+  "versions_changed": false,
+  "commits_created": false,
+  "remote_mutations": false
+}

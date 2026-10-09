@@ -1,0 +1,30 @@
+{
+  "evidence_class": "static_source_and_historical_launch_inspection",
+  "gpu_execution": false,
+  "checkpoint_config_path": "/home/intel/LLM/MiniCPM-V-4.7-35B-A3B-DSpark-1008/config.json",
+  "checkpoint_config_sha256": "3a9774f5d9e78b63ac40e4260054682320c33389d7e4cc116f1874bd73bd39d2",
+  "checkpoint_block_size": 15,
+  "architectures": [
+    "Qwen3DSparkModel"
+  ],
+  "actual_recent_launches": {
+    "dspark-32k-performance-20261009/fixed256/k3_bf16_FULL/launch.json": {
+      "method": "dspark",
+      "model": "/dspark",
+      "num_speculative_tokens": 3,
+      "draft_tensor_parallel_size": 2,
+      "enable_adaptive_verification": false
+    },
+    "dspark-32k-performance-20261009/chat-template-probe/launch.json": {
+      "method": "dspark",
+      "model": "/dspark",
+      "num_speculative_tokens": 3,
+      "draft_tensor_parallel_size": 2,
+      "enable_adaptive_verification": false
+    }
+  },
+  "default_resolution": "vllm/config/speculative.py reads hf block_size only when num_speculative_tokens is None",
+  "attention_kernel_page_size": 64,
+  "hybrid_target_attention_block_size_from_startup_log": 576,
+  "note": "Draft block width, native attention page size and hybrid cache allocation block size are separate parameters; changing draft width is not yet proven to explain long-text acceptance."
+}

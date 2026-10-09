@@ -1,0 +1,27 @@
+ruff.....................................................................Passed
+ruff-format..........................................(no files to check)Skipped
+codespell................................................................Passed
+isort....................................................................Passed
+clang-format.............................................................Passed
+cmake-format.........................................(no files to check)Skipped
+cmake-lint...........................................(no files to check)Skipped
+PyMarkdown...........................................(no files to check)Skipped
+Lint GitHub Actions workflow files...................(no files to check)Skipped
+pip-compile..........................................(no files to check)Skipped
+Run mypy for local Python installation...................................Passed
+Lint shell scripts...................................(no files to check)Skipped
+Lint PNG exports from excalidraw.....................(no files to check)Skipped
+Check SPDX headers.......................................................Passed
+Check for spaces in all filenames........................................Passed
+Enforce import regex as re...............................................Passed
+Suggestion...............................................................Passed
+- hook id: suggestion
+- duration: 0s
+
+To bypass pre-commit hooks, add --no-verify to git commit.
+
+Sign-off Commit..........................................................Passed
+- hook id: signoff-commit
+- duration: 0.01s
+[dev/minicpmv47-dspark-xpu-20261009 098ba18] Support BF16 decode kernels and extend the MoE router to 16 rows
+ 10 files changed, 926 insertions(+), 536 deletions(-)
